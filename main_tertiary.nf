@@ -30,19 +30,19 @@
  * 臨床 WGS/WES 三級分析主 workflow
  *
  * 使用方式：
- *   nextflow run main_tertiary.nf -profile local \
+ *   nextflow -c nextflow_tertiary.config run main_tertiary.nf \
+ *       -profile local \
  *       --sample_id NA12878_WES \
  *       --input_dir /scratch/pylin1991/Pipeline_test/NA12878_WES_PON/NA12878_WES \
  *       --seq_type WES \
- *       --hpo "HP:0001250,HP:0002376" \
- *       --out_dir /scratch/pylin1991/tertiary_test/NA12878_WES \
+ *       --out_dir /scratch/pylin1991/tertiary_test \
  *       -resume
  *
  * 開發進度（Phase 1 進行中）：
  *   ✅ PREPARE_VCF   - ensemble VCF 前處理（CALLERS tag + 過濾）
- *   🔲 SNV_ANNOTATE  - VEP annotation（Phase 1 下一步）
- *   🔲 PARSE_CSQ     - transcript 選取 + MANE_ALL JSON
- *   🔲 ACMG_CLASSIFY - ACMG evidence 收集與分類
+ *   ✅ SNV_ANNOTATE  - VEP 115 annotation（Phase 1）
+ *   ✅ PARSE_CSQ     - transcript 選取 + MANE_ALL JSON（Phase 1 下一步）
+ *   🔲 ACMG_CLASSIFY - ACMG evidence 收集與分類（Phase 1）
  *   🔲 CNV_SV        - AnnotSV（Phase 2）
  *   🔲 MITO          - mtDNA annotation（Phase 3）
  *   🔲 STR           - STRchive rule-based（Phase 3）
@@ -59,10 +59,11 @@ nextflow.enable.dsl = 2
 // 匯入 modules
 // ──────────────────────────────────────────────────────────────
 
-include { PREPARE_VCF } from './modules/prepare_vcf.nf'
+include { PREPARE_VCF   } from './modules/prepare_vcf.nf'
+include { SNV_ANNOTATE  } from './modules/snv_annotation.nf'
+include { PARSE_VEP_CSQ } from './modules/parse_csq.nf'
 // 後續 phase 逐步新增：
-// include { SNV_ANNOTATE } from './modules/snv_annotation.nf'
-// include { PARSE_CSQ    } from './modules/parse_csq.nf'
+// include { ACMG_CLASSIFY } from './modules/acmg_classifier.nf'
 
 // ──────────────────────────────────────────────────────────────
 // 參數驗證
@@ -90,6 +91,27 @@ def validate_params() {
     if (!input_dir.exists()) {
         error "[ERROR] input_dir 不存在：${params.input_dir}"
     }
+
+    // 確認必要的資料庫路徑存在（早期報錯，避免跑到一半才失敗）
+    def vep_cache = file(params.vep_cache)
+    if (!vep_cache.exists()) {
+        error "[ERROR] VEP cache 目錄不存在：${params.vep_cache}"
+    }
+
+    def dbnsfp = file(params.dbnsfp)
+    if (!dbnsfp.exists()) {
+        error "[ERROR] dbNSFP 找不到：${params.dbnsfp}"
+    }
+
+    def loftee_dir = file(params.loftee_dir)
+    if (!loftee_dir.exists()) {
+        error "[ERROR] LOFTEE 資料目錄不存在：${params.loftee_dir}"
+    }
+
+    def clinvar = file(params.clinvar)
+    if (!clinvar.exists()) {
+        error "[ERROR] ClinVar VCF 找不到：${params.clinvar}"
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -114,6 +136,9 @@ workflow {
     Run Evo2  : ${params.run_evo2}
     Run Phase : ${params.run_phasing}
     容器目錄  : ${params.sif_dir}
+    VEP cache : ${params.vep_cache}
+    dbNSFP    : ${params.dbnsfp}
+    ClinVar   : ${params.clinvar}
     """.stripIndent()
 
     // ── 建立輸入 channel ──────────────────────────────────
@@ -141,10 +166,25 @@ workflow {
     )
 
     // ── Phase 1：VCF 前處理 ───────────────────────────────
+    // 輸入：ensemble VCF（雙 sample column）
+    // 輸出：snv_for_annotation.vcf.gz（單 sample，CALLERS tag，PASS only）
     PREPARE_VCF(ensemble_ch)
 
-    // ── Phase 1 後續（VEP annotation，尚未實作）─────────────
-    // 當 SNV_ANNOTATE module 完成後，串接如下：
-    // SNV_ANNOTATE(PREPARE_VCF.out.snv_ch)
-    // PARSE_CSQ(SNV_ANNOTATE.out)
+    // ── Phase 1：VEP Annotation + Pangolin ───────────────
+    // 輸入：PREPARE_VCF 輸出的 snv_ch（snv_for_annotation.vcf.gz）
+    // 輸出：
+    //   vep_ch      → *.vep.vcf.gz（含所有 annotation）
+    //   pangolin_ch → *.pangolin.vcf.gz（splice candidate 的 Pangolin 分數）
+    SNV_ANNOTATE(PREPARE_VCF.out.snv_ch)
+
+    // ── Phase 1：CSQ 解析 + Pangolin 整合 ────────────────
+    // 輸入：VEP VCF + Pangolin VCF
+    // 輸出：snv_indel.annotated.tsv（直接輸出到樣本根目錄）
+    PARSE_VEP_CSQ(
+        SNV_ANNOTATE.out.vep_ch,
+        SNV_ANNOTATE.out.pangolin_ch
+    )
+
+    // ── Phase 1 後續（尚未實作）──────────────────────────
+    // ACMG_CLASSIFY(PARSE_VEP_CSQ.out.tsv_ch)
 }
