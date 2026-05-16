@@ -9,11 +9,27 @@
  *            National Cheng Kung University Hospital
  * Contact  : p88124019@gs.ncku.edu.tw
  *
- * Copyright (c) 2026, Po-Yu Lin
- * Licensed under the MIT License
- *
- * This pipeline was developed for clinical germline variant
- * analysis. Please cite appropriately if used in research.
+ * Copyright (c) 2026, Po-Yu Lin (林伯昱)
+ * 
+ *  * This program is free software: you can redistribute it and/or modify
+ *  * it under the terms of the GNU General Public License as published by
+ *  * the Free Software Foundation, either version 3 of the License, or
+ *  * (at your option) any later version.
+ *  *
+ *  * This program is distributed in the hope that it will be useful,
+ *  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  * GNU General Public License for more details.
+ *  *
+ *  * You should have received a copy of the GNU General Public License
+ *  * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *  *
+ *  * THIRD-PARTY TOOLS NOTICE:
+ *  * This pipeline orchestrates third-party tools subject to their own licenses.
+ *  * Users of main_research.nf must comply with:
+ *  *   - Manta (Illumina): PolyForm Strict License 1.0.0 (non-commercial only)
+ *  *   - ExpansionHunter (Illumina): PolyForm Strict License 1.0.0 (non-commercial only)
+ *  * See README.md and LICENSE for details.
  *
  * DISCLAIMER: This pipeline is provided "as is" without
  * warranty of any kind. The authors and their institution
