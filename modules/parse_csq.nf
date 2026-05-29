@@ -33,7 +33,6 @@
  * direct, indirect, or consequential damages arising from
  * its use.
  * =========================================================
- */
  * modules/parse_csq.nf
  * ====================
  * 目的：
@@ -57,7 +56,6 @@ process PARSE_CSQ {
 
     container "${params.sif_dir}/tertiary_python_1.0.0.sif"
 
-    // publishDir 直接輸出到樣本根目錄（計畫書 Section 15 的輸出規格）
     publishDir "${params.out_dir}/${sample_id}", mode: 'copy'
 
     input:
@@ -66,26 +64,26 @@ process PARSE_CSQ {
 
     output:
     tuple val(sample_id),
+          path("${sample_id}.snv_indel.full.annotated.tsv"),
+          emit: full_tsv
+    tuple val(sample_id),
           path("${sample_id}.snv_indel.annotated.tsv"),
-          emit: tsv_ch
+          emit: filtered_tsv
 
     script:
     """
     python3 ${params.scripts_dir}/parse_vep_csq.py \\
-        --vep_vcf      ${vep_vcf} \\
-        --pangolin_vcf ${pangolin_vcf} \\
-        --sample_id    ${sample_id} \\
-        --output       ${sample_id}.snv_indel.annotated.tsv
+        --vep_vcf         ${vep_vcf} \\
+        --pangolin_vcf    ${pangolin_vcf} \\
+        --clinvar_lookup  ${params.clinvar_lookup_tsv} \\
+        --sample_id       ${sample_id} \\
+        --output_full     ${sample_id}.snv_indel.full.annotated.tsv \\
+        --output_filtered ${sample_id}.snv_indel.annotated.tsv
 
-    # 輸出統計
     echo "[PARSE_CSQ] ${sample_id} 完成" >&2
-    TOTAL=\$(wc -l < ${sample_id}.snv_indel.annotated.tsv)
-    echo "[PARSE_CSQ] 輸出 \$(( TOTAL - 1 )) variants" >&2
-
-    # 確認 Pangolin 有命中
-    PANG_HITS=\$(awk -F'\\t' 'NR>1 && \$51 != "."' \\
-        ${sample_id}.snv_indel.annotated.tsv | wc -l)
-    echo "[PARSE_CSQ] Pangolin 命中：\${PANG_HITS} variants" >&2
+    FULL=\$(wc -l < ${sample_id}.snv_indel.full.annotated.tsv)
+    FILT=\$(wc -l < ${sample_id}.snv_indel.annotated.tsv)
+    echo "[PARSE_CSQ] full: \$(( FULL - 1 )) variants, filtered: \$(( FILT - 1 )) variants" >&2
     """
 }
 
@@ -95,12 +93,13 @@ process PARSE_CSQ {
 
 workflow PARSE_VEP_CSQ {
     take:
-    vep_ch      // tuple val(sample_id), path(vep_vcf), path(vep_tbi)
-    pangolin_ch // tuple val(sample_id), path(pangolin_vcf), path(pangolin_tbi)
+    vep_ch
+    pangolin_ch
 
     main:
     PARSE_CSQ(vep_ch, pangolin_ch)
 
     emit:
-    tsv_ch = PARSE_CSQ.out.tsv_ch
+    full_tsv_ch     = PARSE_CSQ.out.full_tsv
+    filtered_tsv_ch = PARSE_CSQ.out.filtered_tsv
 }

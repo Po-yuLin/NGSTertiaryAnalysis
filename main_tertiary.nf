@@ -58,7 +58,7 @@
  *   ✅ PREPARE_VCF   - ensemble VCF 前處理（CALLERS tag + 過濾）
  *   ✅ SNV_ANNOTATE  - VEP 115 annotation（Phase 1）
  *   ✅ PARSE_CSQ     - transcript 選取 + MANE_ALL JSON（Phase 1 下一步）
- *   🔲 ACMG_CLASSIFY - ACMG evidence 收集與分類（Phase 1）
+ *   ✅ ACMG_CLASSIFY - ACMG evidence 收集與分類（Phase 1）
  *   🔲 CNV_SV        - AnnotSV（Phase 2）
  *   🔲 MITO          - mtDNA annotation（Phase 3）
  *   🔲 STR           - STRchive rule-based（Phase 3）
@@ -77,9 +77,8 @@ nextflow.enable.dsl = 2
 
 include { PREPARE_VCF   } from './modules/prepare_vcf.nf'
 include { SNV_ANNOTATE  } from './modules/snv_annotation.nf'
-include { PARSE_VEP_CSQ } from './modules/parse_csq.nf'
-// 後續 phase 逐步新增：
-// include { ACMG_CLASSIFY } from './modules/acmg_classifier.nf'
+include { PARSE_VEP_CSQ  } from './modules/parse_csq.nf'
+include { ACMG_CLASSIFY } from './modules/acmg_classifier.nf'
 
 // ──────────────────────────────────────────────────────────────
 // 參數驗證
@@ -128,6 +127,20 @@ def validate_params() {
     if (!clinvar.exists()) {
         error "[ERROR] ClinVar VCF 找不到：${params.clinvar}"
     }
+
+    // ClinGen HI + MOI 是 optional，存在才驗證
+    if (params.clingen_hi_tsv) {
+        def clingen_hi = file(params.clingen_hi_tsv)
+        if (!clingen_hi.exists()) {
+            log.warn "[WARN] ClinGen HI TSV 不存在：${params.clingen_hi_tsv}\n       PVS1 將使用簡化版"
+        }
+    }
+    if (params.gene_moi_tsv) {
+        def gene_moi = file(params.gene_moi_tsv)
+        if (!gene_moi.exists()) {
+            log.warn "[WARN] gene_moi.tsv.gz 不存在：${params.gene_moi_tsv}\n       PM2 將使用純 AF 閾值判斷"
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -155,6 +168,8 @@ workflow {
     VEP cache : ${params.vep_cache}
     dbNSFP    : ${params.dbnsfp}
     ClinVar   : ${params.clinvar}
+    ClinGen HI: ${params.clingen_hi_tsv ?: '（未提供，PVS1 簡化版）'}
+    Gene MOI  : ${params.gene_moi_tsv   ?: '（未提供，PM2 純 AF 模式）'}
     """.stripIndent()
 
     // ── 建立輸入 channel ──────────────────────────────────
@@ -201,6 +216,20 @@ workflow {
         SNV_ANNOTATE.out.pangolin_ch
     )
 
-    // ── Phase 1 後續（尚未實作）──────────────────────────
-    // ACMG_CLASSIFY(PARSE_VEP_CSQ.out.tsv_ch)
+    // ── Phase 1：ACMG 分類 ───────────────────────────────
+    // 輸入：PARSE_VEP_CSQ 輸出的 full TSV（56 欄完整版）
+    // 輸出：acmg.tsv（56 欄 + 4 個 ACMG 欄位）
+    def clingen_hi_file = (params.clingen_hi_tsv && file(params.clingen_hi_tsv).exists())
+        ? file(params.clingen_hi_tsv)
+        : file("NO_FILE")
+
+    def gene_moi_file = (params.gene_moi_tsv && file(params.gene_moi_tsv).exists())
+        ? file(params.gene_moi_tsv)
+        : file("NO_FILE")
+
+    ACMG_CLASSIFY(
+        PARSE_VEP_CSQ.out.full_tsv_ch,   // tuple(sample_id, full_annotated.tsv)
+        clingen_hi_file,                  // ClinGen HI TSV（PVS1 HI 過濾）
+        gene_moi_file                     // gene_moi.tsv.gz（PM2 MOI 判斷）
+    )
 }

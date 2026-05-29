@@ -8,20 +8,8 @@
  *            National Cheng Kung University Hospital
  * Contact  : p88124019@gs.ncku.edu.tw
  *
- * Copyright (c) 2026, Po-Yu Lin (林伯昱)
- * 
- *  * This program is free software: you can redistribute it and/or modify
- *  * it under the terms of the GNU General Public License as published by
- *  * the Free Software Foundation, either version 3 of the License, or
- *  * (at your option) any later version.
- *  *
- *  * This program is distributed in the hope that it will be useful,
- *  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *  * GNU General Public License for more details.
- *  *
- *  * You should have received a copy of the GNU General Public License
- *  * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ * Copyright (c) 2026, Po-Yu Lin
+ * Licensed under the MIT License
  *
  * DISCLAIMER: This pipeline is provided "as is" without
  * warranty of any kind. The authors and their institution
@@ -47,6 +35,7 @@
  *       - LoFtool（基因 LoF 容忍度）
  *       - ClinVar 20260418（CLNSIG、CLNREVSTAT、CLNDN、CLNSIGCONF）
  *       - gnomAD（VEP cache 內建，--af_gnomadg + --af_gnomade）
+ *       - 1000 Genomes（VEP cache 內建，--af_1kg，提供 EAS_AF 等次族群頻率）
  *
  *     annotation 旗標（CSQ 欄位內容）：
  *       - --hgvs    ：輸出 HGVSc / HGVSp（TSV 主表必要欄位，無此旗標欄位為空）
@@ -163,7 +152,8 @@ DANN_score,\\
 PHACTboost_score,\\
 phyloP100way_vertebrate,\\
 GERP++_RS,\\
-gnomAD_exomes_AF,gnomAD_exomes_EAS_AF \\
+gnomAD_exomes_AF,gnomAD_exomes_EAS_AF,\\
+PKNN_LLR \\
         \\
         --plugin LoF,\\
 loftee_path:/opt/vep/Plugins/,\\
@@ -181,6 +171,7 @@ fields=CLNSIG%CLNREVSTAT%CLNDN%CLNSIGCONF \\
         \\
         --af_gnomadg \\
         --af_gnomade \\
+        --af_1kg \\
         --force_overwrite \\
         --no_stats \\
         --safe
