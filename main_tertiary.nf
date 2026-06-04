@@ -1,7 +1,7 @@
 #!/usr/bin/env nextflow
 /*
  * =========================================================
- * WGS/WES Germline Analysis Pipeline - Alignment Module
+ * WGS/WES Germline Analysis Pipeline
  * =========================================================
  * Author   : Po-Yu Lin (林伯昱)
  * Institute: Department of Neurology and
@@ -10,26 +10,7 @@
  * Contact  : p88124019@gs.ncku.edu.tw
  *
  * Copyright (c) 2026, Po-Yu Lin (林伯昱)
- * 
- *  * This program is free software: you can redistribute it and/or modify
- *  * it under the terms of the GNU General Public License as published by
- *  * the Free Software Foundation, either version 3 of the License, or
- *  * (at your option) any later version.
- *  *
- *  * This program is distributed in the hope that it will be useful,
- *  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- *  * GNU General Public License for more details.
- *  *
- *  * You should have received a copy of the GNU General Public License
- *  * along with this program. If not, see <https://www.gnu.org/licenses/>.
- *  *
- *  * THIRD-PARTY TOOLS NOTICE:
- *  * This pipeline orchestrates third-party tools subject to their own licenses.
- *  * Users of main_research.nf must comply with:
- *  *   - Manta (Illumina): PolyForm Strict License 1.0.0 (non-commercial only)
- *  *   - ExpansionHunter (Illumina): PolyForm Strict License 1.0.0 (non-commercial only)
- *  * See README.md and LICENSE for details.
+ * Licensed under the GNU General Public License v3.0
  *
  * DISCLAIMER: This pipeline is provided "as is" without
  * warranty of any kind. The authors and their institution
@@ -37,36 +18,59 @@
  * accuracy, completeness, or suitability of the analysis
  * results for any clinical or research purpose. Users are
  * solely responsible for validating and interpreting all
- * results. This software shall not be held liable for any
- * direct, indirect, or consequential damages arising from
- * its use.
+ * results.
  * =========================================================
  * main_tertiary.nf
  * ================
- * 臨床 WGS/WES 三級分析主 workflow
+ * 臨床 WGS/WES 三級分析主 workflow（支援 sample sheet 批次輸入）
+ *
+ * 支援兩種輸入來源（sample sheet 的 pipeline_type 欄位切換）：
+ *
+ *   nckuh：NCKUH 二級分析 ensemble VCF
+ *     路徑規則：{input_dir}/04_snv_indel/{sample_id}.ensemble.fixed.vcf.gz
+ *
+ *   dragen：Illumina DRAGEN hard-filtered VCF
+ *     路徑規則：{input_dir}/vcf.gz/{sample_id}.hard-filtered.vcf.gz
+ *
+ * --pipeline_type（選填）：過濾 sample sheet 中 pipeline_type 符合的 row。
+ *   不傳入 → 要求 sample sheet 內所有 row 的 pipeline_type 一致（否則 error）
+ *   傳入   → 只跑符合的 row，不符合的 warn 後跳過
+ *
+ * Sample sheet 格式（CSV）：
+ *   sample_id,pipeline_type,input_dir,seq_type,hpo
+ *   NA12878_WES,nckuh,/path/to/nckuh_output,WES,
+ *   VAL-10,dragen,/path/to/dragen_output,WGS,HP:0001250|HP:0001263
+ *   VAL-11,dragen,/path/to/dragen_output,WGS,
  *
  * 使用方式：
+ *   # 不傳 --pipeline_type（sample sheet 裡必須全部同一種）
  *   nextflow -c nextflow_tertiary.config run main_tertiary.nf \
  *       -profile local \
- *       --sample_id NA12878_WES \
- *       --input_dir /scratch/pylin1991/Pipeline_test/NA12878_WES_PON/NA12878_WES \
- *       --seq_type WES \
+ *       --samplesheet samplesheet_tertiary.csv \
  *       --out_dir /scratch/pylin1991/tertiary_test \
  *       -resume
  *
- * 開發進度（Phase 1 進行中）：
- *   ✅ PREPARE_VCF   - ensemble VCF 前處理（CALLERS tag + 過濾）
- *   ✅ SNV_ANNOTATE  - VEP 115 annotation（Phase 1）
- *   ✅ PARSE_CSQ     - transcript 選取 + MANE_ALL JSON（Phase 1 下一步）
- *   ✅ ACMG_CLASSIFY - ACMG evidence 收集與分類（Phase 1）
- *   🔲 CNV_SV        - AnnotSV（Phase 2）
- *   🔲 MITO          - mtDNA annotation（Phase 3）
- *   🔲 STR           - STRchive rule-based（Phase 3）
- *   🔲 ROH           - consanguinity + UPD（Phase 2）
- *   🔲 PHENOTYPE     - Exomiser + LIRICAL（Phase 2）
- *   🔲 WHATS_HAP     - phasing（Phase 4，條件觸發）
- *   🔲 PGX           - Aldy（Phase 3）
- *   🔲 SECONDARY     - ACMG SF v3.2（Phase 3）
+ *   # 傳 --pipeline_type 過濾（sample sheet 可以混放，只跑指定的那種）
+ *   nextflow -c nextflow_tertiary.config run main_tertiary.nf \
+ *       -profile dgm \
+ *       --pipeline_type dragen \
+ *       --samplesheet all_samples.csv \
+ *       --out_dir /home/pipeline/tertiary_output \
+ *       -resume
+ *
+ * 開發進度：
+ *   ✅ PREPARE_VCF        - NCKUH ensemble VCF 前處理
+ *   ✅ PREPARE_VCF_DRAGEN - DRAGEN VCF 前處理（chrM 分流）
+ *   ✅ SNV_ANNOTATE       - VEP 115 annotation
+ *   ✅ PARSE_VEP_CSQ      - transcript 選取 + TSV 產生
+ *   ✅ ACMG_CLASSIFY      - ACMG evidence 分類
+ *   🔲 MITO              - mtDNA annotation（mito_ch 已備妥）
+ *   🔲 CNV_SV            - AnnotSV
+ *   🔲 STR               - STRchive
+ *   🔲 ROH               - consanguinity + UPD
+ *   🔲 PHENOTYPE         - Exomiser + LIRICAL
+ *   🔲 PGX               - Aldy
+ *   🔲 SECONDARY         - ACMG SF v3.2
  */
 
 nextflow.enable.dsl = 2
@@ -75,71 +79,143 @@ nextflow.enable.dsl = 2
 // 匯入 modules
 // ──────────────────────────────────────────────────────────────
 
-include { PREPARE_VCF   } from './modules/prepare_vcf.nf'
-include { SNV_ANNOTATE  } from './modules/snv_annotation.nf'
-include { PARSE_VEP_CSQ  } from './modules/parse_csq.nf'
-include { ACMG_CLASSIFY } from './modules/acmg_classifier.nf'
+include { PREPARE_VCF        } from './modules/prepare_vcf.nf'
+include { PREPARE_VCF_DRAGEN } from './modules/prepare_vcf_dragen.nf'
+include { SNV_ANNOTATE       } from './modules/snv_annotation.nf'
+include { PARSE_VEP_CSQ      } from './modules/parse_csq.nf'
+include { ACMG_CLASSIFY      } from './modules/acmg_classifier.nf'
 
 // ──────────────────────────────────────────────────────────────
-// 參數驗證
+// Sample sheet 解析
 // ──────────────────────────────────────────────────────────────
 
-def validate_params() {
-    // 必填參數檢查
-    if (!params.sample_id) {
-        error "[ERROR] --sample_id 為必填參數，例如：--sample_id NA12878_WES"
-    }
-    if (!params.input_dir) {
-        error "[ERROR] --input_dir 為必填參數（二級分析輸出目錄）"
-    }
-    if (!params.out_dir) {
-        error "[ERROR] --out_dir 為必填參數（三級分析輸出目錄）"
+def parse_samplesheet(csv_path, pipeline_type_filter = null) {
+    /*
+     * 解析三級分析 sample sheet（CSV）。
+     * 回傳 list of maps，每個 map 對應一個樣本。
+     *
+     * 必要欄位：sample_id, pipeline_type, input_dir, seq_type
+     * 選填欄位：hpo（空白表示無）
+     *
+     * pipeline_type_filter（來自 --pipeline_type 參數）：
+     *   null   → 不過濾，但要求 sample sheet 內所有 row 的 pipeline_type 一致
+     *   有值   → 只保留 pipeline_type 符合的 row，不符合的 warn 後跳過
+     *
+     * 驗證規則：
+     *   - 必要欄位不得為空
+     *   - pipeline_type 只接受 nckuh 或 dragen
+     *   - seq_type 只接受 WES 或 WGS
+     *   - sample_id 不得重複
+     *   - 過濾後至少要有一個樣本
+     */
+
+    def csv_file = file(csv_path)
+    if (!csv_file.exists()) {
+        error "[ERROR] Sample sheet 不存在：${csv_path}"
     }
 
-    // seq_type 只能是 WES 或 WGS
-    if (!['WES', 'WGS'].contains(params.seq_type)) {
-        error "[ERROR] --seq_type 必須是 WES 或 WGS，目前值：${params.seq_type}"
-    }
+    def lines    = csv_file.readLines()
+    def header   = lines[0].split(',').collect { it.trim() }
+    def samples  = []
+    def seen_ids = [] as Set
 
-    // 確認輸入目錄存在
-    def input_dir = file(params.input_dir)
-    if (!input_dir.exists()) {
-        error "[ERROR] input_dir 不存在：${params.input_dir}"
-    }
-
-    // 確認必要的資料庫路徑存在（早期報錯，避免跑到一半才失敗）
-    def vep_cache = file(params.vep_cache)
-    if (!vep_cache.exists()) {
-        error "[ERROR] VEP cache 目錄不存在：${params.vep_cache}"
-    }
-
-    def dbnsfp = file(params.dbnsfp)
-    if (!dbnsfp.exists()) {
-        error "[ERROR] dbNSFP 找不到：${params.dbnsfp}"
-    }
-
-    def loftee_dir = file(params.loftee_dir)
-    if (!loftee_dir.exists()) {
-        error "[ERROR] LOFTEE 資料目錄不存在：${params.loftee_dir}"
-    }
-
-    def clinvar = file(params.clinvar)
-    if (!clinvar.exists()) {
-        error "[ERROR] ClinVar VCF 找不到：${params.clinvar}"
-    }
-
-    // ClinGen HI + MOI 是 optional，存在才驗證
-    if (params.clingen_hi_tsv) {
-        def clingen_hi = file(params.clingen_hi_tsv)
-        if (!clingen_hi.exists()) {
-            log.warn "[WARN] ClinGen HI TSV 不存在：${params.clingen_hi_tsv}\n       PVS1 將使用簡化版"
+    // 確認必要欄位存在
+    def required_cols = ['sample_id', 'pipeline_type', 'input_dir', 'seq_type']
+    for (col in required_cols) {
+        if (!header.contains(col)) {
+            error "[ERROR] Sample sheet 缺少必要欄位：${col}\n       現有欄位：${header}"
         }
     }
-    if (params.gene_moi_tsv) {
-        def gene_moi = file(params.gene_moi_tsv)
-        if (!gene_moi.exists()) {
-            log.warn "[WARN] gene_moi.tsv.gz 不存在：${params.gene_moi_tsv}\n       PM2 將使用純 AF 閾值判斷"
+
+    // 解析每一行
+    lines[1..-1].eachWithIndex { line, idx ->
+        line = line.trim()
+        if (!line || line.startsWith('#')) return  // 跳過空行和 comment
+
+        def row_num = idx + 2  // 給使用者看的行號（從 2 開始，1 是 header）
+        def values  = line.split(',', -1).collect { it.trim() }
+
+        // 欄位數量檢查
+        if (values.size() < header.size()) {
+            // 補齊空欄位
+            while (values.size() < header.size()) values << ''
         }
+
+        def row = [header, values].transpose().collectEntries { k, v -> [(k): v] }
+
+        // 必要欄位不得為空
+        for (col in required_cols) {
+            if (!row[col]) {
+                error "[ERROR] Sample sheet 第 ${row_num} 行，欄位 '${col}' 不得為空"
+            }
+        }
+
+        // pipeline_type 驗證
+        if (!['nckuh', 'dragen'].contains(row.pipeline_type)) {
+            error "[ERROR] Sample sheet 第 ${row_num} 行，pipeline_type '${row.pipeline_type}' 無效\n       只接受：nckuh 或 dragen"
+        }
+
+        // seq_type 驗證
+        if (!['WES', 'WGS'].contains(row.seq_type)) {
+            error "[ERROR] Sample sheet 第 ${row_num} 行，seq_type '${row.seq_type}' 無效\n       只接受：WES 或 WGS"
+        }
+
+        // sample_id 重複檢查
+        if (seen_ids.contains(row.sample_id)) {
+            error "[ERROR] Sample sheet 第 ${row_num} 行，sample_id '${row.sample_id}' 重複"
+        }
+        seen_ids << row.sample_id
+
+        // input_dir 存在檢查
+        def input_dir = file(row.input_dir)
+        if (!input_dir.exists()) {
+            error "[ERROR] Sample sheet 第 ${row_num} 行，input_dir 不存在：${row.input_dir}"
+        }
+
+        // hpo 預設空字串
+        row.hpo = row.hpo ?: ''
+
+        // pipeline_type_filter 過濾（來自 --pipeline_type 參數）
+        if (pipeline_type_filter && row.pipeline_type != pipeline_type_filter) {
+            log.warn "[WARN] 樣本 ${row.sample_id} 的 pipeline_type=${row.pipeline_type}" +
+                     " 不符合 --pipeline_type=${pipeline_type_filter}，跳過"
+            return
+        }
+
+        samples << row
+    }
+
+    if (samples.isEmpty()) {
+        error "[ERROR] Sample sheet 沒有任何有效樣本：${csv_path}"
+    }
+
+    return samples
+}
+
+// ──────────────────────────────────────────────────────────────
+// 共用參數驗證（資料庫路徑）
+// ──────────────────────────────────────────────────────────────
+
+def validate_databases() {
+    def checks = [
+        ['VEP cache',  params.vep_cache],
+        ['dbNSFP',     params.dbnsfp],
+        ['LOFTEE dir', params.loftee_dir],
+        ['ClinVar',    params.clinvar],
+    ]
+    for (chk in checks) {
+        def f = file(chk[1])
+        if (!f.exists()) {
+            error "[ERROR] ${chk[0]} 不存在：${chk[1]}"
+        }
+    }
+
+    // Optional 資料庫（只 warn）
+    if (params.clingen_hi_tsv && !file(params.clingen_hi_tsv).exists()) {
+        log.warn "[WARN] ClinGen HI TSV 不存在：${params.clingen_hi_tsv}\n       PVS1 將使用簡化版"
+    }
+    if (params.gene_moi_tsv && !file(params.gene_moi_tsv).exists()) {
+        log.warn "[WARN] gene_moi.tsv.gz 不存在：${params.gene_moi_tsv}\n       PM2 將使用純 AF 閾值判斷"
     }
 }
 
@@ -149,76 +225,100 @@ def validate_params() {
 
 workflow {
 
-    // 執行參數驗證
-    validate_params()
+    // ── 基本參數檢查 ──────────────────────────────────────────
+    if (!params.samplesheet) {
+        error "[ERROR] --samplesheet 為必填參數\n       例如：--samplesheet samplesheet_tertiary.csv"
+    }
+    if (!params.out_dir) {
+        error "[ERROR] --out_dir 為必填參數"
+    }
 
-    // 印出執行資訊
+    // ── 解析 sample sheet ─────────────────────────────────────
+    def samples = parse_samplesheet(params.samplesheet, params.pipeline_type ?: null)
+
+    // ── pipeline_type 決定與一致性檢查 ──────────────────────────
+    def pipeline_types = samples.collect { it.pipeline_type }.unique()
+
+    // --pipeline_type 傳入時：已在 parse_samplesheet 過濾，pipeline_types 必定只有一種
+    // --pipeline_type 未傳入時：要求 sample sheet 內所有 row 一致
+    if (!params.pipeline_type && pipeline_types.size() > 1) {
+        error "[ERROR] Sample sheet 含有多種 pipeline_type：${pipeline_types}\n" +
+              "       請拆成兩個 sample sheet 分別執行，\n" +
+              "       或用 --pipeline_type 指定要跑的那種（其他 row 會被跳過）"
+    }
+    def pipeline_type = pipeline_types[0]
+
+    // ── 資料庫路徑驗證 ────────────────────────────────────────
+    validate_databases()
+
+    // ── 印出執行資訊 ──────────────────────────────────────────
     log.info """
     ╔══════════════════════════════════════════════════════╗
     ║         臨床三級分析 Pipeline  v1.0.0                ║
     ╚══════════════════════════════════════════════════════╝
-    樣本 ID   : ${params.sample_id}
-    定序類型  : ${params.seq_type}
-    輸入目錄  : ${params.input_dir}
-    輸出目錄  : ${params.out_dir}
-    HPO 輸入  : ${params.hpo ?: '（未提供）'}
-    Run Evo2  : ${params.run_evo2}
-    Run Phase : ${params.run_phasing}
-    容器目錄  : ${params.sif_dir}
-    VEP cache : ${params.vep_cache}
-    dbNSFP    : ${params.dbnsfp}
-    ClinVar   : ${params.clinvar}
-    ClinGen HI: ${params.clingen_hi_tsv ?: '（未提供，PVS1 簡化版）'}
-    Gene MOI  : ${params.gene_moi_tsv   ?: '（未提供，PM2 純 AF 模式）'}
+    Pipeline 類型 : ${pipeline_type.toUpperCase()}
+    樣本數        : ${samples.size()}
+    Sample sheet  : ${params.samplesheet}
+    輸出目錄      : ${params.out_dir}
+    容器目錄      : ${params.sif_dir}
+    VEP cache     : ${params.vep_cache}
+    dbNSFP        : ${params.dbnsfp}
+    ClinVar       : ${params.clinvar}
+    ClinGen HI    : ${params.clingen_hi_tsv ?: '（未提供，PVS1 簡化版）'}
+    Gene MOI      : ${params.gene_moi_tsv   ?: '（未提供，PM2 純 AF 模式）'}
     """.stripIndent()
 
-    // ── 建立輸入 channel ──────────────────────────────────
-    // 從二級分析輸出目錄找到 ensemble VCF
-    // 路徑規則：{input_dir}/04_snv_indel/{sample_id}.ensemble.fixed.vcf.gz
-
-    def ensemble_vcf = file(
-        "${params.input_dir}/04_snv_indel/${params.sample_id}.ensemble.fixed.vcf.gz"
-    )
-    def ensemble_tbi = file(
-        "${params.input_dir}/04_snv_indel/${params.sample_id}.ensemble.fixed.vcf.gz.tbi"
-    )
-
-    // 確認輸入檔案存在
-    if (!ensemble_vcf.exists()) {
-        error "[ERROR] 找不到 ensemble VCF：${ensemble_vcf}"
-    }
-    if (!ensemble_tbi.exists()) {
-        error "[ERROR] 找不到 ensemble VCF index：${ensemble_tbi}"
+    // 印出樣本清單
+    samples.each { s ->
+        log.info "  樣本：${s.sample_id}  seq_type=${s.seq_type}  input=${s.input_dir}"
     }
 
-    // 建立 channel：tuple(sample_id, vcf, tbi)
-    ensemble_ch = Channel.of(
-        tuple(params.sample_id, ensemble_vcf, ensemble_tbi)
-    )
+    // ── 建立 channel（依 pipeline_type 推導 VCF 路徑）────────
+    if (pipeline_type == 'nckuh') {
 
-    // ── Phase 1：VCF 前處理 ───────────────────────────────
-    // 輸入：ensemble VCF（雙 sample column）
-    // 輸出：snv_for_annotation.vcf.gz（單 sample，CALLERS tag，PASS only）
-    PREPARE_VCF(ensemble_ch)
+        // NCKUH：{input_dir}/04_snv_indel/{sample_id}.ensemble.fixed.vcf.gz
+        input_ch = Channel.fromList(samples).map { s ->
+            def vcf = file("${s.input_dir}/04_snv_indel/${s.sample_id}.ensemble.fixed.vcf.gz")
+            def tbi = file("${s.input_dir}/04_snv_indel/${s.sample_id}.ensemble.fixed.vcf.gz.tbi")
+            if (!vcf.exists()) {
+                error "[ERROR] 找不到 ensemble VCF：${vcf}"
+            }
+            if (!tbi.exists()) {
+                error "[ERROR] 找不到 ensemble VCF index：${tbi}"
+            }
+            tuple(s.sample_id, vcf, tbi)
+        }
 
-    // ── Phase 1：VEP Annotation + Pangolin ───────────────
-    // 輸入：PREPARE_VCF 輸出的 snv_ch（snv_for_annotation.vcf.gz）
-    // 輸出：
-    //   vep_ch      → *.vep.vcf.gz（含所有 annotation）
-    //   pangolin_ch → *.pangolin.vcf.gz（splice candidate 的 Pangolin 分數）
-    SNV_ANNOTATE(PREPARE_VCF.out.snv_ch)
+        PREPARE_VCF(input_ch)
+        snv_ch = PREPARE_VCF.out.snv_ch
 
-    // ── Phase 1：CSQ 解析 + Pangolin 整合 ────────────────
-    // 輸入：VEP VCF + Pangolin VCF
-    // 輸出：snv_indel.annotated.tsv（直接輸出到樣本根目錄）
+    } else {
+
+        // DRAGEN：{input_dir}/vcf.gz/{sample_id}.hard-filtered.vcf.gz
+        input_ch = Channel.fromList(samples).map { s ->
+            def vcf = file("${s.input_dir}/vcf.gz/${s.sample_id}.hard-filtered.vcf.gz")
+            if (!vcf.exists()) {
+                error "[ERROR] 找不到 DRAGEN VCF：${vcf}"
+            }
+            // tbi 不在這裡檢查：由 ENSURE_DRAGEN_TBI process 自動建立
+            tuple(s.sample_id, vcf)
+        }
+
+        PREPARE_VCF_DRAGEN(input_ch)
+        snv_ch = PREPARE_VCF_DRAGEN.out.snv_ch
+        // mito_ch 備妥，等 Mito module 開發完成後接上：
+        // MITO_ANNOTATE(PREPARE_VCF_DRAGEN.out.mito_ch)
+    }
+
+    // ── 以下完全共用（兩種 pipeline 相同）────────────────────
+
+    SNV_ANNOTATE(snv_ch)
+
     PARSE_VEP_CSQ(
         SNV_ANNOTATE.out.vep_ch,
         SNV_ANNOTATE.out.pangolin_ch
     )
 
-    // ── Phase 1：ACMG 分類 ───────────────────────────────
-    // 輸入：PARSE_VEP_CSQ 輸出的 full TSV（56 欄完整版）
-    // 輸出：acmg.tsv（56 欄 + 4 個 ACMG 欄位）
     def clingen_hi_file = (params.clingen_hi_tsv && file(params.clingen_hi_tsv).exists())
         ? file(params.clingen_hi_tsv)
         : file("NO_FILE")
@@ -228,8 +328,8 @@ workflow {
         : file("NO_FILE")
 
     ACMG_CLASSIFY(
-        PARSE_VEP_CSQ.out.full_tsv_ch,   // tuple(sample_id, full_annotated.tsv)
-        clingen_hi_file,                  // ClinGen HI TSV（PVS1 HI 過濾）
-        gene_moi_file                     // gene_moi.tsv.gz（PM2 MOI 判斷）
+        PARSE_VEP_CSQ.out.full_tsv_ch,
+        clingen_hi_file,
+        gene_moi_file
     )
 }

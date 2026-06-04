@@ -526,13 +526,15 @@ OUTPUT_COLUMNS = [
  
 def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
                   clinvar_lookup: dict, sample_id: str,
-                  output_full: str, output_filtered: str):
+                  output_full: str, output_filtered: str,
+                  input_type: str = "ensemble"):
  
     csq_fields = parse_csq_fields(vep_vcf)
     opener = gzip.open if vep_vcf.endswith(".gz") else open
  
-    sample_dv = f"{sample_id}_DV"
-    sample_hc = f"{sample_id}_HC"
+    # ── sample column 設定（依 input_type）────────────────────
+    sample_dv = f"{sample_id}_DV" if input_type == "ensemble" else sample_id
+    sample_hc = f"{sample_id}_HC" if input_type == "ensemble" else None
     col_dv = None
     col_hc = None
  
@@ -555,7 +557,7 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
                 cols = line.split("\t")
                 if sample_dv in cols:
                     col_dv = cols.index(sample_dv)
-                if sample_hc in cols:
+                if sample_hc and sample_hc in cols:
                     col_hc = cols.index(sample_hc)
                 continue
  
@@ -573,7 +575,7 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
             info    = parts[7]
             fmt     = parts[8] if len(parts) > 8 else ""
             smp_dv  = parts[col_dv] if col_dv and col_dv < len(parts) else "."
-            smp_hc  = parts[col_hc] if col_hc and col_hc < len(parts) else "."
+            smp_hc  = parts[col_hc] if col_hc and col_hc < len(parts) else "."  # DRAGEN 時為 "."
  
             # INFO 欄位解析
             info_dict = {}
@@ -583,22 +585,24 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
                     info_dict[k] = v
  
             callers = info_dict.get("CALLERS", ".")
-            dp_dv   = info_dict.get("DP_DV", ".")
-            ad_dv   = info_dict.get("AD_DV", ".")
-            vaf_dv  = info_dict.get("VAF_DV", ".")
-            dp_hc   = info_dict.get("DP_HC", ".")
-            ad_hc   = info_dict.get("AD_HC", ".")
- 
+
+            if input_type == "dragen":
+                # DRAGEN 單一 sample：INFO tag 名稱不同
+                dp_dv   = info_dict.get("DP_DRAGEN", ".")
+                ad_dv   = info_dict.get("AD_DRAGEN", ".")
+                vaf_dv  = info_dict.get("VAF_DRAGEN", ".")
+                dp_hc   = "."   # DRAGEN 無 HC
+                ad_hc   = "."
+            else:
+                dp_dv   = info_dict.get("DP_DV", ".")
+                ad_dv   = info_dict.get("AD_DV", ".")
+                vaf_dv  = info_dict.get("VAF_DV", ".")
+                dp_hc   = info_dict.get("DP_HC", ".")
+                ad_hc   = info_dict.get("AD_HC", ".")
+
             gt_dv    = parse_gt_field(fmt, smp_dv, "GT")
             gt_hc    = parse_gt_field(fmt, smp_hc, "GT")
             zygosity = infer_zygosity(gt_dv, gt_hc, chrom)
- 
-            # ClinVar（VEP custom annotation）
-            clinvar_sig     = info_dict.get("ClinVar_CLNSIG", ".")
-            clinvar_revstat = info_dict.get("ClinVar_CLNREVSTAT", ".")
-            clinvar_dn      = info_dict.get("ClinVar_CLNDN", ".")
-            clinvar_sigconf = info_dict.get("ClinVar_CLNSIGCONF", ".")
-            clinvar_stars   = clnrevstat_to_stars(clinvar_revstat)
  
             # CSQ 解析
             csq_raw = info_dict.get("CSQ", "")
@@ -618,7 +622,16 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
  
             # ★ v2.9：從 MANE Select 中選最嚴重 consequence 的代表 transcript
             picked_tx = pick_representative_transcript(transcripts)
- 
+
+            # ClinVar（VEP --custom annotation，在 VCF 格式下放在 CSQ 欄位內）
+            # 注意：VCF 格式的 VEP 輸出，custom annotation 不在 top-level INFO，
+            #       而是在每個 transcript 的 CSQ pipe-separated 欄位裡
+            clinvar_sig     = get(picked_tx, "ClinVar_CLNSIG")
+            clinvar_revstat = get(picked_tx, "ClinVar_CLNREVSTAT")
+            clinvar_dn      = get(picked_tx, "ClinVar_CLNDN")
+            clinvar_sigconf = get(picked_tx, "ClinVar_CLNSIGCONF")
+            clinvar_stars   = clnrevstat_to_stars(clinvar_revstat)
+
             # 從代表 transcript 提取欄位
             gene            = get(picked_tx, "SYMBOL")
             transcript      = get(picked_tx, "Feature")
@@ -795,6 +808,9 @@ def main():
                         help="完整輸出 TSV（archive 用）")
     parser.add_argument("--output_filtered",  required=True,
                         help="過濾輸出 TSV（GUI 用）")
+    parser.add_argument("--input_type",       default="ensemble",
+                        choices=["ensemble", "dragen"],
+                        help="輸入 VCF 類型：ensemble（DV+HC，預設）或 dragen（單一 sample）")
     args = parser.parse_args()
  
     print(f"[parse_vep_csq] 載入 Pangolin 分數：{args.pangolin_vcf}", file=sys.stderr)
@@ -807,7 +823,8 @@ def main():
     print(f"[parse_vep_csq] 解析 VEP VCF：{args.vep_vcf}", file=sys.stderr)
     parse_vep_vcf(
         args.vep_vcf, pangolin_scores, clinvar_lookup,
-        args.sample_id, args.output_full, args.output_filtered
+        args.sample_id, args.output_full, args.output_filtered,
+        input_type=args.input_type,
     )
  
  

@@ -162,12 +162,7 @@ conservation_file:/opt/vep/Plugins/loftee_data/loftee.sql \\
         \\
         --plugin LoFtool,/opt/vep/Plugins/loftee_data/LoFtool_scores.txt \\
         \\
-        --custom file=${params.clinvar},\\
-short_name=ClinVar,\\
-format=vcf,\\
-type=exact,\\
-coords=0,\\
-fields=CLNSIG%CLNREVSTAT%CLNDN%CLNSIGCONF \\
+        --custom file=${params.clinvar},short_name=ClinVar,format=vcf,type=exact,coords=0,fields=CLNSIG%CLNREVSTAT%CLNDN%CLNSIGCONF \\
         \\
         --af_gnomadg \\
         --af_gnomade \\
@@ -222,8 +217,17 @@ process PANGOLIN_SCORE {
         bgzip -c splice_header.vcf > ${sample_id}.pangolin.vcf.gz
 
     else
-        # Step 2：合併 header + splice body，送進 Pangolin
-        cat splice_header.vcf splice_body.vcf > splice_for_pangolin.vcf
+        # Step 2：移除 CSQ + 過濾 alt/random contig，再送 Pangolin
+        # 原因 1：WGS CSQ 可能長達 270KB，Pangolin parse 時 segfault
+        # 原因 2：Pangolin gencode DB 沒有 alt/random contig 的 gene model，
+        #         碰到 chr*_alt / chr*_random / chrUn_* 也會 segfault
+        # bcftools view --regions 需要 bgzip+tabix 輸入，無法直接接 pipe
+        # 改用 grep + awk：先移除 CSQ，再只保留標準染色體（chr1-22,X,Y,M）
+        # alt/random contig 的 Pangolin gencode DB 沒有 gene model，會 segfault
+        cat splice_header.vcf splice_body.vcf \
+            | bcftools annotate -x INFO/CSQ \
+            | grep -E '^#|^chr([0-9]+|[XYM])\t' \
+            > splice_for_pangolin.vcf
 
         # Step 3：執行 Pangolin（GPU）
         # output_file 是 prefix，Pangolin 自動加 .vcf

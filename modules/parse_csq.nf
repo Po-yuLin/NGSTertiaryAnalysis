@@ -56,7 +56,11 @@ process PARSE_CSQ {
 
     container "${params.sif_dir}/tertiary_python_1.0.0.sif"
 
-    publishDir "${params.out_dir}/${sample_id}", mode: 'copy'
+    // full TSV 和 filtered TSV 都不 publish：
+    //   - full TSV 是 ACMG classifier 的中間輸入，最終產物是 03_acmg/
+    //   - filtered TSV 目前只供除錯用，GUI 會直接讀 acmg.tsv
+    //   - 需要時去 Nextflow work/ 目錄撈即可
+    // publishDir "${params.out_dir}/${sample_id}", mode: 'copy'
 
     input:
     tuple val(sample_id), path(vep_vcf), path(vep_tbi)
@@ -77,6 +81,7 @@ process PARSE_CSQ {
         --pangolin_vcf    ${pangolin_vcf} \\
         --clinvar_lookup  ${params.clinvar_lookup_tsv} \\
         --sample_id       ${sample_id} \\
+        --input_type      ${params.input_type ?: (params.pipeline_type == 'dragen' ? 'dragen' : 'ensemble')} \\
         --output_full     ${sample_id}.snv_indel.full.annotated.tsv \\
         --output_filtered ${sample_id}.snv_indel.annotated.tsv
 
