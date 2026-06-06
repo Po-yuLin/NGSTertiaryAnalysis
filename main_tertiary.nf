@@ -64,7 +64,7 @@
  *   ✅ SNV_ANNOTATE       - VEP 115 annotation
  *   ✅ PARSE_VEP_CSQ      - transcript 選取 + TSV 產生
  *   ✅ ACMG_CLASSIFY      - ACMG evidence 分類
- *   🔲 MITO              - mtDNA annotation（mito_ch 已備妥）
+ *   ✅ MITO_ANNOTATE      - mtDNA annotation（VEP + MITOMAP）
  *   🔲 CNV_SV            - AnnotSV
  *   🔲 STR               - STRchive
  *   🔲 ROH               - consanguinity + UPD
@@ -84,6 +84,7 @@ include { PREPARE_VCF_DRAGEN } from './modules/prepare_vcf_dragen.nf'
 include { SNV_ANNOTATE       } from './modules/snv_annotation.nf'
 include { PARSE_VEP_CSQ      } from './modules/parse_csq.nf'
 include { ACMG_CLASSIFY      } from './modules/acmg_classifier.nf'
+include { MITO_ANNOTATE      } from './modules/mito_annotation.nf'
 
 // ──────────────────────────────────────────────────────────────
 // Sample sheet 解析
@@ -292,6 +293,24 @@ workflow {
         PREPARE_VCF(input_ch)
         snv_ch = PREPARE_VCF.out.snv_ch
 
+        // NCKUH mito：{input_dir}/07_mitochondria/{sample_id}.mito.vcf.gz
+        // 格式統一為 tuple(sample_id, pipeline_type, mito_vcf, mito_tbi)
+        // 與 DRAGEN 的 mito_ch 格式相同，供 MITO_ANNOTATE 共用
+        nckuh_mito_ch = Channel.fromList(samples).map { s ->
+            def mito_vcf = file("${s.input_dir}/07_mitochondria/${s.sample_id}.mito.vcf.gz")
+            def mito_tbi = file("${s.input_dir}/07_mitochondria/${s.sample_id}.mito.vcf.gz.tbi")
+            if (!mito_vcf.exists()) {
+                // mito 不是所有樣本都有，找不到只 warn 不中斷
+                log.warn "[WARN] 找不到 mito VCF，跳過：${mito_vcf}"
+                return null
+            }
+            tuple(s.sample_id, "nckuh", mito_vcf, mito_tbi)
+        }
+        // 過濾掉 null（找不到 mito VCF 的樣本）
+        .filter { it != null }
+
+        MITO_ANNOTATE(nckuh_mito_ch)
+
     } else {
 
         // DRAGEN：{input_dir}/vcf.gz/{sample_id}.hard-filtered.vcf.gz
@@ -306,8 +325,15 @@ workflow {
 
         PREPARE_VCF_DRAGEN(input_ch)
         snv_ch = PREPARE_VCF_DRAGEN.out.snv_ch
-        // mito_ch 備妥，等 Mito module 開發完成後接上：
-        // MITO_ANNOTATE(PREPARE_VCF_DRAGEN.out.mito_ch)
+
+        // DRAGEN mito_ch 已由 PREPARE_VCF_DRAGEN 備妥
+        // 格式：tuple(sample_id, mito_vcf.gz, mito_tbi)
+        // 加上 pipeline_type，統一成 tuple(sample_id, pipeline_type, mito_vcf, mito_tbi)
+        dragen_mito_ch = PREPARE_VCF_DRAGEN.out.mito_ch.map { sample_id, mito_vcf, mito_tbi ->
+            tuple(sample_id, "dragen", mito_vcf, mito_tbi)
+        }
+
+        MITO_ANNOTATE(dragen_mito_ch)
     }
 
     // ── 以下完全共用（兩種 pipeline 相同）────────────────────
