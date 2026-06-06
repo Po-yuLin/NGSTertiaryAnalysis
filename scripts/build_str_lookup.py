@@ -126,8 +126,10 @@ def locus_to_row(locus: dict, key: str) -> list:
         safe_str(locus.get("disease")),
         safe_str(locus.get("disease_id")),
         safe_str(locus.get("inheritance")),
+        safe_str(locus.get("benign_min")),       # 正常下限（缺失型 locus 需要）
         safe_str(locus.get("benign_max")),
         safe_str(locus.get("pathogenic_min")),
+        safe_str(locus.get("pathogenic_max")),   # 致病上限（缺失型 locus 需要）
         safe_str(locus.get("intermediate_min")),
         safe_str(locus.get("intermediate_max")),
         safe_str(locus.get("locus_structure")),
@@ -144,7 +146,8 @@ OUTPUT_COLS = [
     "KEY", "STR_ID", "GENE", "CHROM",
     "START_HG38", "END_HG38", "MOTIF",
     "DISEASE", "DISEASE_ID", "INHERITANCE",
-    "BENIGN_MAX", "PATHOGENIC_MIN",
+    "BENIGN_MIN", "BENIGN_MAX",
+    "PATHOGENIC_MIN", "PATHOGENIC_MAX",
     "INTERMEDIATE_MIN", "INTERMEDIATE_MAX",
     "LOCUS_STRUCTURE", "TYPE",
 ]
@@ -210,10 +213,10 @@ def build_lookup(json_path: str, output_varid: str, output_pos: str):
 
             # ── 位置查表（NCKUH GangSTR 用）──────────────────
             # key = chrom:pos（VCF 1-based）
-            # 轉換：STRchive start_hg38（0-based）+ 1 = VCF POS
+            # STRchive start_hg38 已經是 1-based，直接使用，不需要加 1
+            # 驗證：HTT start_hg38=3074877，GangSTR POS=3074877，完全一致
             if chrom and start is not None:
-                pos_1based = int(start) + 1
-                key_pos = f"{chrom}:{pos_1based}"
+                key_pos = f"{chrom}:{int(start)}"
                 row_pos = locus_to_row(locus, key_pos)
                 f_pos.write("\t".join(row_pos) + "\n")
                 n_pos += 1

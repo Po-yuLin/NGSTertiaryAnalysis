@@ -65,8 +65,8 @@
  *   ✅ PARSE_VEP_CSQ      - transcript 選取 + TSV 產生
  *   ✅ ACMG_CLASSIFY      - ACMG evidence 分類
  *   ✅ MITO_ANNOTATE      - mtDNA annotation（VEP + MITOMAP）
+ *   ✅ STR_ANNOTATE       - STRchive threshold 分類
  *   🔲 CNV_SV            - AnnotSV
- *   🔲 STR               - STRchive
  *   🔲 ROH               - consanguinity + UPD
  *   🔲 PHENOTYPE         - Exomiser + LIRICAL
  *   🔲 PGX               - Aldy
@@ -85,6 +85,9 @@ include { SNV_ANNOTATE       } from './modules/snv_annotation.nf'
 include { PARSE_VEP_CSQ      } from './modules/parse_csq.nf'
 include { ACMG_CLASSIFY      } from './modules/acmg_classifier.nf'
 include { MITO_ANNOTATE      } from './modules/mito_annotation.nf'
+include { STR_PREPARE_NCKUH  } from './modules/str_annotation.nf'
+include { STR_PARSE_NCKUH    } from './modules/str_annotation.nf'
+include { STR_PARSE_DRAGEN   } from './modules/str_annotation.nf'
 
 // ──────────────────────────────────────────────────────────────
 // Sample sheet 解析
@@ -311,6 +314,24 @@ workflow {
 
         MITO_ANNOTATE(nckuh_mito_ch)
 
+        // NCKUH STR：{input_dir}/06_repeat/{sample_id}.str.vcf（未壓縮）
+        // 格式：tuple(sample_id, pipeline_type, str_vcf)
+        // bgzip + tabix 由 STR_ANNOTATE 內的 STR_PREPARE_NCKUH 處理
+        nckuh_str_ch = Channel.fromList(samples).map { s ->
+            def str_vcf = file("${s.input_dir}/06_repeat/${s.sample_id}.str.vcf")
+            if (!str_vcf.exists()) {
+                log.warn "[WARN] 找不到 STR VCF，跳過：${str_vcf}"
+                return null
+            }
+            // STR_PREPARE_NCKUH 只需要 sample_id 和 vcf（不需要 pipeline_type）
+            tuple(s.sample_id, str_vcf)
+        }
+        .filter { it != null }
+
+        // NCKUH：bgzip + tabix → 解析（兩個 process 串接）
+        STR_PREPARE_NCKUH(nckuh_str_ch)
+        STR_PARSE_NCKUH(STR_PREPARE_NCKUH.out.str_prepared_ch)
+
     } else {
 
         // DRAGEN：{input_dir}/vcf.gz/{sample_id}.hard-filtered.vcf.gz
@@ -334,6 +355,22 @@ workflow {
         }
 
         MITO_ANNOTATE(dragen_mito_ch)
+
+        // DRAGEN STR：{input_dir}/vcf.gz/{sample_id}.repeats.vcf.gz（已壓縮）
+        // 格式：tuple(sample_id, pipeline_type, str_vcf_gz)
+        dragen_str_ch = Channel.fromList(samples).map { s ->
+            def str_vcf = file("${s.input_dir}/vcf.gz/${s.sample_id}.repeats.vcf.gz")
+            if (!str_vcf.exists()) {
+                log.warn "[WARN] 找不到 STR VCF，跳過：${str_vcf}"
+                return null
+            }
+            // STR_PARSE_DRAGEN 只需要 sample_id 和 vcf（不需要 pipeline_type）
+            tuple(s.sample_id, str_vcf)
+        }
+        .filter { it != null }
+
+        // DRAGEN：直接解析（已壓縮，不需前處理）
+        STR_PARSE_DRAGEN(dragen_str_ch)
     }
 
     // ── 以下完全共用（兩種 pipeline 相同）────────────────────
