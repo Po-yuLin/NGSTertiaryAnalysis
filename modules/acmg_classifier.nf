@@ -1,5 +1,16 @@
 /*
  * =========================================================
+ * WGS/WES Germline Analysis Pipeline
+ * =========================================================
+ * Author   : Po-Yu Lin (林伯昱)
+ * Institute: Department of Neurology and
+ *            Department of Genomic Medicine,
+ *            National Cheng Kung University Hospital
+ * Contact  : p88124019@gs.ncku.edu.tw
+ *
+ * Copyright (c) 2026, Po-Yu Lin (林伯昱)
+ * Licensed under the GNU General Public License v3.0
+ * =========================================================
  * modules/acmg_classifier.nf  ── v3.1
  * =========================================================
  * 輸入：

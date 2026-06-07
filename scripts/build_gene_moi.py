@@ -10,7 +10,19 @@
  * Contact  : p88124019@gs.ncku.edu.tw
  *
  * Copyright (c) 2026, Po-Yu Lin (林伯昱)
- * Licensed under the GNU General Public License v3.0
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * DISCLAIMER: This pipeline is provided "as is" without
+ * warranty of any kind. The authors and their institution
+ * make no representations or warranties regarding the
+ * accuracy, completeness, or suitability of the analysis
+ * results for any clinical or research purpose. Users are
+ * solely responsible for validating and interpreting all
+ * results.
  * =========================================================
 
 build_gene_moi.py

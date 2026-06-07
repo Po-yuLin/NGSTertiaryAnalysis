@@ -69,7 +69,7 @@
  *   ✅ CNV_SV_ANNOTATE   - AnnotSV（NCKUH WES/WGS + DRAGEN）
  *   🔲 ROH               - consanguinity + UPD
  *   🔲 PHENOTYPE         - Exomiser + LIRICAL
- *   🔲 PGX               - Aldy
+ *   ✅ PGX               - PharmCAT + StellarPGx（CYP2D6）+ OptiType（HLA）
  *   🔲 SECONDARY         - ACMG SF v3.2
  */
 
@@ -96,6 +96,7 @@ include { PREPARE_CNV_DRAGEN     } from './modules/cnv_sv_annotation.nf'
 include { PREPARE_SV_DRAGEN      } from './modules/cnv_sv_annotation.nf'
 include { ANNOTSV_CNV_DRAGEN     } from './modules/cnv_sv_annotation.nf'
 include { ANNOTSV_SV_DRAGEN      } from './modules/cnv_sv_annotation.nf'
+include { PGX_ANNOTATE           } from './modules/pgx_annotation.nf'
 
 // ──────────────────────────────────────────────────────────────
 // Sample sheet 解析
@@ -235,6 +236,7 @@ def validate_databases() {
 // 主 workflow
 // ──────────────────────────────────────────────────────────────
 
+
 workflow {
 
     // ── 基本參數檢查 ──────────────────────────────────────────
@@ -251,8 +253,6 @@ workflow {
     // ── pipeline_type 決定與一致性檢查 ──────────────────────────
     def pipeline_types = samples.collect { it.pipeline_type }.unique()
 
-    // --pipeline_type 傳入時：已在 parse_samplesheet 過濾，pipeline_types 必定只有一種
-    // --pipeline_type 未傳入時：要求 sample sheet 內所有 row 一致
     if (!params.pipeline_type && pipeline_types.size() > 1) {
         error "[ERROR] Sample sheet 含有多種 pipeline_type：${pipeline_types}\n" +
               "       請拆成兩個 sample sheet 分別執行，\n" +
@@ -278,12 +278,18 @@ workflow {
     ClinVar       : ${params.clinvar}
     ClinGen HI    : ${params.clingen_hi_tsv ?: '（未提供，PVS1 簡化版）'}
     Gene MOI      : ${params.gene_moi_tsv   ?: '（未提供，PM2 純 AF 模式）'}
+    PGx           : ${params.run_pgx ? '啟用' : '停用'}（--run_pgx）
+    PGx CYP2D6    : ${params.run_pgx_cyp2d6 ? 'StellarPGx BAM-based' : 'VCF only（準確度較低）'}
+    PGx HLA       : ${params.run_pgx_hla ? 'OptiType BAM-based' : '停用'}
     """.stripIndent()
 
     // 印出樣本清單
     samples.each { s ->
         log.info "  樣本：${s.sample_id}  seq_type=${s.seq_type}  input=${s.input_dir}"
     }
+
+    // ── BAM channel 預先定義（scope 跨 if/else）────────────────
+    def bam_ch_pgx = Channel.empty()
 
     // ── 建立 channel（依 pipeline_type 推導 VCF 路徑）────────
     if (pipeline_type == 'nckuh') {
@@ -305,38 +311,30 @@ workflow {
         snv_ch = PREPARE_VCF.out.snv_ch
 
         // NCKUH mito：{input_dir}/07_mitochondria/{sample_id}.mito.vcf.gz
-        // 格式統一為 tuple(sample_id, pipeline_type, mito_vcf, mito_tbi)
-        // 與 DRAGEN 的 mito_ch 格式相同，供 MITO_ANNOTATE 共用
         nckuh_mito_ch = Channel.fromList(samples).map { s ->
             def mito_vcf = file("${s.input_dir}/07_mitochondria/${s.sample_id}.mito.vcf.gz")
             def mito_tbi = file("${s.input_dir}/07_mitochondria/${s.sample_id}.mito.vcf.gz.tbi")
             if (!mito_vcf.exists()) {
-                // mito 不是所有樣本都有，找不到只 warn 不中斷
                 log.warn "[WARN] 找不到 mito VCF，跳過：${mito_vcf}"
                 return null
             }
             tuple(s.sample_id, "nckuh", mito_vcf, mito_tbi)
         }
-        // 過濾掉 null（找不到 mito VCF 的樣本）
         .filter { it != null }
 
         MITO_ANNOTATE(nckuh_mito_ch)
 
         // NCKUH STR：{input_dir}/06_repeat/{sample_id}.str.vcf（未壓縮）
-        // 格式：tuple(sample_id, pipeline_type, str_vcf)
-        // bgzip + tabix 由 STR_ANNOTATE 內的 STR_PREPARE_NCKUH 處理
         nckuh_str_ch = Channel.fromList(samples).map { s ->
             def str_vcf = file("${s.input_dir}/06_repeat/${s.sample_id}.str.vcf")
             if (!str_vcf.exists()) {
                 log.warn "[WARN] 找不到 STR VCF，跳過：${str_vcf}"
                 return null
             }
-            // STR_PREPARE_NCKUH 只需要 sample_id 和 vcf（不需要 pipeline_type）
             tuple(s.sample_id, str_vcf)
         }
         .filter { it != null }
 
-        // NCKUH：bgzip + tabix → 解析（兩個 process 串接）
         STR_PREPARE_NCKUH(nckuh_str_ch)
         STR_PARSE_NCKUH(STR_PREPARE_NCKUH.out.str_prepared_ch)
 
@@ -344,7 +342,6 @@ workflow {
         def seq_types = samples.collect { it.seq_type }.unique()
 
         if (seq_types.contains("WES")) {
-            // WES：gCNV VCF → AnnotSV
             nckuh_cnv_wes_ch = Channel.fromList(samples)
                 .filter { s -> s.seq_type == "WES" }
                 .map { s ->
@@ -362,7 +359,6 @@ workflow {
         }
 
         if (seq_types.contains("WGS")) {
-            // WGS：CNVkit .call.cns → BED → AnnotSV
             nckuh_cnvkit_ch = Channel.fromList(samples)
                 .filter { s -> s.seq_type == "WGS" }
                 .map { s ->
@@ -393,6 +389,22 @@ workflow {
 
         ANNOTSV_SV_NCKUH(nckuh_sv_ch)
 
+        // ── NCKUH BAM channel（PGx CYP2D6/HLA 用）────────────────
+        // StellarPGx 只支援 WGS，WES 樣本直接跳過
+        // BAM 路徑：{input_dir}/02_alignment/{sample_id}.aligned.sorted.bam
+        bam_ch_pgx = Channel.fromList(samples)
+            .filter { s -> s.seq_type == "WGS" }
+            .map { s ->
+                def bam = file("${s.input_dir}/02_alignment/${s.sample_id}.aligned.sorted.bam")
+                def bai = file("${s.input_dir}/02_alignment/${s.sample_id}.aligned.sorted.bam.bai")
+                if (!bam.exists()) {
+                    log.warn "[WARN] 找不到 BAM，CYP2D6/HLA outside call 跳過（PGx 改用 VCF 模式）：${bam}"
+                    return null
+                }
+                tuple(s.sample_id, bam, bai)
+            }
+            .filter { it != null }
+
     } else {
 
         // DRAGEN：{input_dir}/vcf.gz/{sample_id}.hard-filtered.vcf.gz
@@ -401,36 +413,28 @@ workflow {
             if (!vcf.exists()) {
                 error "[ERROR] 找不到 DRAGEN VCF：${vcf}"
             }
-            // tbi 不在這裡檢查：由 ENSURE_DRAGEN_TBI process 自動建立
             tuple(s.sample_id, vcf)
         }
 
         PREPARE_VCF_DRAGEN(input_ch)
         snv_ch = PREPARE_VCF_DRAGEN.out.snv_ch
 
-        // DRAGEN mito_ch 已由 PREPARE_VCF_DRAGEN 備妥
-        // 格式：tuple(sample_id, mito_vcf.gz, mito_tbi)
-        // 加上 pipeline_type，統一成 tuple(sample_id, pipeline_type, mito_vcf, mito_tbi)
         dragen_mito_ch = PREPARE_VCF_DRAGEN.out.mito_ch.map { sample_id, mito_vcf, mito_tbi ->
             tuple(sample_id, "dragen", mito_vcf, mito_tbi)
         }
 
         MITO_ANNOTATE(dragen_mito_ch)
 
-        // DRAGEN STR：{input_dir}/vcf.gz/{sample_id}.repeats.vcf.gz（已壓縮）
-        // 格式：tuple(sample_id, pipeline_type, str_vcf_gz)
         dragen_str_ch = Channel.fromList(samples).map { s ->
             def str_vcf = file("${s.input_dir}/vcf.gz/${s.sample_id}.repeats.vcf.gz")
             if (!str_vcf.exists()) {
                 log.warn "[WARN] 找不到 STR VCF，跳過：${str_vcf}"
                 return null
             }
-            // STR_PARSE_DRAGEN 只需要 sample_id 和 vcf（不需要 pipeline_type）
             tuple(s.sample_id, str_vcf)
         }
         .filter { it != null }
 
-        // DRAGEN：直接解析（已壓縮，不需前處理）
         STR_PARSE_DRAGEN(dragen_str_ch)
 
         // ── DRAGEN CNV ────────────────────────────────────────
@@ -444,12 +448,10 @@ workflow {
         }
         .filter { it != null }
 
-        // DRAGEN CNV：先過濾 non-PASS 和 copy-neutral segment
         PREPARE_CNV_DRAGEN(dragen_cnv_ch)
         ANNOTSV_CNV_DRAGEN(PREPARE_CNV_DRAGEN.out.cnv_filtered_ch)
 
         // ── DRAGEN SV ─────────────────────────────────────────
-        // 用 sv.vcf.gz（不用 cnv_sv.vcf.gz），避免 CNV 和 SV event 重疊
         dragen_sv_ch = Channel.fromList(samples).map { s ->
             def vcf = file("${s.input_dir}/vcf.gz/${s.sample_id}.sv.vcf.gz")
             if (!vcf.exists()) {
@@ -460,9 +462,26 @@ workflow {
         }
         .filter { it != null }
 
-        // DRAGEN SV：先過濾 PASS + 把 INS 真實序列換成 <INS> symbolic allele
         PREPARE_SV_DRAGEN(dragen_sv_ch)
         ANNOTSV_SV_DRAGEN(PREPARE_SV_DRAGEN.out.sv_filtered_ch)
+
+        // ── DRAGEN BAM channel（PGx CYP2D6/HLA 用）──────────────
+        // DRAGEN 輸出 BAM 路徑依版本可能不同，嘗試兩個慣用路徑
+        bam_ch_pgx = Channel.fromList(samples).map { s ->
+            def bam = file("${s.input_dir}/bam/${s.sample_id}.bam")
+            def bai = file("${s.input_dir}/bam/${s.sample_id}.bam.bai")
+            if (!bam.exists()) {
+                // 備用路徑（DRAGEN 直接放上層目錄）
+                bam = file("${s.input_dir}/${s.sample_id}.bam")
+                bai = file("${s.input_dir}/${s.sample_id}.bam.bai")
+            }
+            if (!bam.exists()) {
+                log.warn "[WARN] 找不到 DRAGEN BAM，CYP2D6/HLA outside call 跳過（PGx 改用 VCF 模式）：${bam}"
+                return null
+            }
+            tuple(s.sample_id, bam, bai)
+        }
+        .filter { it != null }
     }
 
     // ── 以下完全共用（兩種 pipeline 相同）────────────────────
@@ -487,4 +506,28 @@ workflow {
         clingen_hi_file,
         gene_moi_file
     )
+
+    // ── PGx annotation（PharmCAT + StellarPGx）────────────────
+    // --run_pgx false（預設）→ 跳過
+    // --run_pgx true  → 啟用；WGS 走 StellarPGx（CYP2D6 BAM-based），WES 直接 VCF
+    if (params.run_pgx) {
+        // WGS：帶 BAM 進去，StellarPGx 在 PGX_ANNOTATE 內部跑
+        pgx_wgs_ch = snv_ch
+            .join(bam_ch_pgx)
+            .map { sid, vcf, tbi, bam, bai ->
+                tuple(sid, pipeline_type, vcf, tbi, bam, bai)
+            }
+
+        // WES：沒有 BAM，直接進 PharmCAT（純 VCF 模式）
+        pgx_wes_ch = snv_ch
+            .join(bam_ch_pgx, remainder: true)
+            .filter { vals -> vals[3] == null }   // 沒有 BAM 的樣本
+            .map { vals -> tuple(vals[0], pipeline_type, vals[1], vals[2]) }
+
+        PGX_ANNOTATE(
+            pgx_wgs_ch,
+            pgx_wes_ch,
+            MITO_ANNOTATE.out.mito_tsv_ch.ifEmpty(Channel.empty())
+        )
+    }
 }
