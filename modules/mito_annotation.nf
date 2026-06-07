@@ -15,7 +15,7 @@
  * ==========================
  * 目的：
  *   對 mito VCF 進行輕量 VEP 註解，再用 parse_mito_vcf.py
- *   整合 MITOMAP 資訊，輸出臨床用 mito TSV。
+ *   整合 gnomAD mito v3.1（CC0）和 ClinVar 資訊，輸出臨床用 mito TSV。
  *
  * 兩個 process：
  *
@@ -34,7 +34,7 @@
  *   Process 2 - MITO_PARSE：
  *     呼叫 parse_mito_vcf.py：
  *       - 解析 VEP CSQ 欄位
- *       - 查詢 mitomap_lookup.tsv.gz（MITOMAP 致病性資料庫）
+ *       - 查詢 gnomad_mito_lookup.tsv.gz（gnomAD mito v3.1，CC0）
  *       - 讀取 FORMAT/AF（heteroplasmy level）和 FORMAT/DP
  *       - 輸出 {SAMPLE_ID}.mito.tsv（22 欄）
  *
@@ -160,7 +160,7 @@ process MITO_VEP {
 }
 
 // ──────────────────────────────────────────────────────────────
-// Process 2：解析 VEP CSQ + 查 MITOMAP → 輸出 TSV
+// Process 2：解析 VEP CSQ + 查 gnomAD mito → 輸出 TSV
 // ──────────────────────────────────────────────────────────────
 
 process MITO_PARSE {
@@ -187,7 +187,7 @@ process MITO_PARSE {
     python3 ${params.scripts_dir}/parse_mito_vcf.py \\
         --vcf      ${mito_vep_vcf} \\
         --sample   ${sample_id} \\
-        --mitomap  ${params.mitomap_lookup} \\
+        --gnomad_mito ${params.gnomad_mito_lookup} \\
         --pipeline ${pipeline_type} \\
         --output   ${sample_id}.mito.tsv
 
@@ -215,7 +215,7 @@ workflow MITO_ANNOTATE {
     // Step 1：過濾 PASS（NCKUH only）+ VEP 輕量 annotation
     MITO_VEP(mito_ch)
 
-    // Step 2：解析 CSQ + 查 MITOMAP → TSV
+    // Step 2：解析 CSQ + 查 gnomAD mito → TSV
     MITO_PARSE(MITO_VEP.out.mito_vep_ch)
 
     emit:

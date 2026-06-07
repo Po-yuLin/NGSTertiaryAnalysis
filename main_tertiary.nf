@@ -66,7 +66,7 @@
  *   ✅ ACMG_CLASSIFY      - ACMG evidence 分類
  *   ✅ MITO_ANNOTATE      - mtDNA annotation（VEP + MITOMAP）
  *   ✅ STR_ANNOTATE       - STRchive threshold 分類
- *   🔲 CNV_SV            - AnnotSV
+ *   ✅ CNV_SV_ANNOTATE   - AnnotSV（NCKUH WES/WGS + DRAGEN）
  *   🔲 ROH               - consanguinity + UPD
  *   🔲 PHENOTYPE         - Exomiser + LIRICAL
  *   🔲 PGX               - Aldy
@@ -88,6 +88,14 @@ include { MITO_ANNOTATE      } from './modules/mito_annotation.nf'
 include { STR_PREPARE_NCKUH  } from './modules/str_annotation.nf'
 include { STR_PARSE_NCKUH    } from './modules/str_annotation.nf'
 include { STR_PARSE_DRAGEN   } from './modules/str_annotation.nf'
+include { CNVKIT_TO_BED          } from './modules/cnv_sv_annotation.nf'
+include { ANNOTSV_CNV_NCKUH_WES  } from './modules/cnv_sv_annotation.nf'
+include { ANNOTSV_CNV_NCKUH_WGS  } from './modules/cnv_sv_annotation.nf'
+include { ANNOTSV_SV_NCKUH       } from './modules/cnv_sv_annotation.nf'
+include { PREPARE_CNV_DRAGEN     } from './modules/cnv_sv_annotation.nf'
+include { PREPARE_SV_DRAGEN      } from './modules/cnv_sv_annotation.nf'
+include { ANNOTSV_CNV_DRAGEN     } from './modules/cnv_sv_annotation.nf'
+include { ANNOTSV_SV_DRAGEN      } from './modules/cnv_sv_annotation.nf'
 
 // ──────────────────────────────────────────────────────────────
 // Sample sheet 解析
@@ -332,6 +340,59 @@ workflow {
         STR_PREPARE_NCKUH(nckuh_str_ch)
         STR_PARSE_NCKUH(STR_PREPARE_NCKUH.out.str_prepared_ch)
 
+        // ── NCKUH CNV：依 seq_type 分流 WES / WGS ────────────────
+        def seq_types = samples.collect { it.seq_type }.unique()
+
+        if (seq_types.contains("WES")) {
+            // WES：gCNV VCF → AnnotSV
+            nckuh_cnv_wes_ch = Channel.fromList(samples)
+                .filter { s -> s.seq_type == "WES" }
+                .map { s ->
+                    def vcf = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.gcnv.vcf.gz")
+                    def tbi = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.gcnv.vcf.gz.tbi")
+                    if (!vcf.exists()) {
+                        log.warn "[WARN] 找不到 gCNV VCF，跳過：${vcf}"
+                        return null
+                    }
+                    tuple(s.sample_id, vcf, tbi)
+                }
+                .filter { it != null }
+
+            ANNOTSV_CNV_NCKUH_WES(nckuh_cnv_wes_ch)
+        }
+
+        if (seq_types.contains("WGS")) {
+            // WGS：CNVkit .call.cns → BED → AnnotSV
+            nckuh_cnvkit_ch = Channel.fromList(samples)
+                .filter { s -> s.seq_type == "WGS" }
+                .map { s ->
+                    def cns = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.call.cns")
+                    if (!cns.exists()) {
+                        log.warn "[WARN] 找不到 CNVkit .call.cns，跳過：${cns}"
+                        return null
+                    }
+                    tuple(s.sample_id, cns)
+                }
+                .filter { it != null }
+
+            CNVKIT_TO_BED(nckuh_cnvkit_ch)
+            ANNOTSV_CNV_NCKUH_WGS(CNVKIT_TO_BED.out.cnvkit_bed_ch)
+        }
+
+        // ── NCKUH SV（Delly，WES + WGS 共用）────────────────────
+        nckuh_sv_ch = Channel.fromList(samples).map { s ->
+            def vcf = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.delly.vcf.gz")
+            def tbi = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.delly.vcf.gz.tbi")
+            if (!vcf.exists()) {
+                log.warn "[WARN] 找不到 Delly VCF，跳過：${vcf}"
+                return null
+            }
+            tuple(s.sample_id, vcf, tbi)
+        }
+        .filter { it != null }
+
+        ANNOTSV_SV_NCKUH(nckuh_sv_ch)
+
     } else {
 
         // DRAGEN：{input_dir}/vcf.gz/{sample_id}.hard-filtered.vcf.gz
@@ -371,6 +432,37 @@ workflow {
 
         // DRAGEN：直接解析（已壓縮，不需前處理）
         STR_PARSE_DRAGEN(dragen_str_ch)
+
+        // ── DRAGEN CNV ────────────────────────────────────────
+        dragen_cnv_ch = Channel.fromList(samples).map { s ->
+            def vcf = file("${s.input_dir}/vcf.gz/${s.sample_id}.cnv.vcf.gz")
+            if (!vcf.exists()) {
+                log.warn "[WARN] 找不到 DRAGEN CNV VCF，跳過：${vcf}"
+                return null
+            }
+            tuple(s.sample_id, vcf)
+        }
+        .filter { it != null }
+
+        // DRAGEN CNV：先過濾 non-PASS 和 copy-neutral segment
+        PREPARE_CNV_DRAGEN(dragen_cnv_ch)
+        ANNOTSV_CNV_DRAGEN(PREPARE_CNV_DRAGEN.out.cnv_filtered_ch)
+
+        // ── DRAGEN SV ─────────────────────────────────────────
+        // 用 sv.vcf.gz（不用 cnv_sv.vcf.gz），避免 CNV 和 SV event 重疊
+        dragen_sv_ch = Channel.fromList(samples).map { s ->
+            def vcf = file("${s.input_dir}/vcf.gz/${s.sample_id}.sv.vcf.gz")
+            if (!vcf.exists()) {
+                log.warn "[WARN] 找不到 DRAGEN SV VCF，跳過：${vcf}"
+                return null
+            }
+            tuple(s.sample_id, vcf)
+        }
+        .filter { it != null }
+
+        // DRAGEN SV：先過濾 PASS + 把 INS 真實序列換成 <INS> symbolic allele
+        PREPARE_SV_DRAGEN(dragen_sv_ch)
+        ANNOTSV_SV_DRAGEN(PREPARE_SV_DRAGEN.out.sv_filtered_ch)
     }
 
     // ── 以下完全共用（兩種 pipeline 相同）────────────────────
