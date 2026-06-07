@@ -114,20 +114,30 @@ process FILTER_FOR_ANNOTATION {
 
     script:
     """
-    # 過濾策略：
-    #   -f PASS,RefCall：只保留 FILTER=PASS 或 RefCall 的 variant
-    #   後面再用 -e 排除真正的 RefCall（FILTER="RefCall"）
-    #   以及排除兩個 caller 都沒有有效 call 的 variant
+    # 過濾策略：依據 CALLERS tag 過濾，不使用 FILTER 欄位。
     #
-    # 實際上我們要的是：
-    #   保留 FILTER=PASS，且至少一個 caller 有非 ref/missing 的 GT
+    # 背景：
+    #   ensemble VCF 的 FILTER 欄位由二級分析設定，語義如下：
+    #     FILTER=PASS    → DV 有 call（DV+HC 或 DV-only）
+    #     FILTER=RefCall → DV 叫 0/0（HC 可能有 call 也可能是 ./.）
+    #     FILTER=.       → 兩個 caller 都沒有 call
     #
-    # bcftools filter 邏輯：
-    #   -i 'FILTER="PASS"'  → 只保留 PASS variant
-    #   這樣 RefCall 就自動被排除了
+    # 問題：
+    #   用 FILTER="PASS" 過濾會把所有 HC-only variant（FILTER=RefCall）
+    #   全部丟掉，違反 joint calling「只要有一個 caller call 到就保留」的規則。
+    #   NA12878_WES 測試確認：HC-only 佔 23.9%（8,897/37,198 個），不應被丟棄。
+    #
+    # 修正：
+    #   add_callers_tag.py 已根據 GT 欄位正確判斷每個 variant 的 call 狀態：
+    #     CALLERS=DV+HC → 兩個都有 ALT call，來自 FILTER=PASS
+    #     CALLERS=DV    → 只有 DV 有 ALT call，來自 FILTER=PASS
+    #     CALLERS=HC    → 只有 HC 有 ALT call，來自 FILTER=RefCall（HC=0/1）
+    #   RefCall 中 DV=0/0, HC=./. 的 variant，CALLERS 被判為 HC（但 is_called 回傳 False）
+    #   → 實際上這種 case 兩個 caller 都沒有 call，不會有 CALLERS tag。
+    #   所以只要 CALLERS 有值，就代表至少一個 caller 有有效的 ALT call。
 
     bcftools view \\
-        -i 'FILTER="PASS"' \\
+        -i 'INFO/CALLERS="DV+HC" || INFO/CALLERS="DV" || INFO/CALLERS="HC"' \\
         ${callers_tagged_vcf} \\
         -Oz -o ${sample_id}.snv_for_annotation.vcf.gz
 
