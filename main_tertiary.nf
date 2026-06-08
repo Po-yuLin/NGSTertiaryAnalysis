@@ -511,18 +511,31 @@ workflow {
     // --run_pgx false（預設）→ 跳過
     // --run_pgx true  → 啟用；WGS 走 StellarPGx（CYP2D6 BAM-based），WES 直接 VCF
     if (params.run_pgx) {
-        // WGS：帶 BAM 進去，StellarPGx 在 PGX_ANNOTATE 內部跑
+
+        // pipeline_type lookup channel（從 samples 建立）
+        ptype_ch = Channel.fromList(samples)
+            .map { s -> tuple(s.sample_id, s.pipeline_type) }
+
+        // WGS：帶 BAM 進去，StellarPGx + OptiType 在 PGX_ANNOTATE 內部跑
         pgx_wgs_ch = snv_ch
             .join(bam_ch_pgx)
-            .map { sid, vcf, tbi, bam, bai ->
-                tuple(sid, pipeline_type, vcf, tbi, bam, bai)
+            .join(ptype_ch)
+            .map { sid, vcf, tbi, bam, bai, ptype ->
+                tuple(sid, ptype, vcf, tbi, bam, bai)
             }
 
         // WES：沒有 BAM，直接進 PharmCAT（純 VCF 模式）
         pgx_wes_ch = snv_ch
             .join(bam_ch_pgx, remainder: true)
             .filter { vals -> vals[3] == null }   // 沒有 BAM 的樣本
-            .map { vals -> tuple(vals[0], pipeline_type, vals[1], vals[2]) }
+            .join(ptype_ch)
+            .map { vals ->
+                def sid   = vals[0]
+                def vcf   = vals[1]
+                def tbi   = vals[2]
+                def ptype = vals[4]
+                tuple(sid, ptype, vcf, tbi)
+            }
 
         PGX_ANNOTATE(
             pgx_wgs_ch,

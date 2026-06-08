@@ -281,19 +281,94 @@ process PGX_STELLARPGX {
 // ──────────────────────────────────────────────────────────────
 // Process 2：OptiType — HLA-A/HLA-B outside caller（BAM-based）
 // ──────────────────────────────────────────────────────────────
+// Process 2a：HLA reads 擷取（samtools，BAM → single-end fastq）
+// ──────────────────────────────────────────────────────────────
+// hg38 HLA reads 分散在三處：
+//   1. chr6:29940260-33086201（HLA-A/B/C/DRB1 核心區域）
+//   2. chr6 alt contigs（16 個，HLA alt haplotype reads）
+//   3. unmapped reads（-f 4，無法比對到 reference 的 HLA reads）
+// NCKUH 和 DRAGEN BAM 的 alt contig 名稱相同（chr6_ prefix，已驗證）
+// Single-end 輸出原因：
+//   從 BAM 重建的 reads 配對關係不完整（混合 region/alt/unmapped）
+//   sort -n + fastq -1 -2 會丟棄大量 singleton → 只剩 ~44 reads
+//   OptiType paired-end 模式預設 unpaired_weight=0，singleton 不計分
+//   single-end 所有 reads 都計分，實測 reads 數量和準確度更好（~6475 reads）
+
+process PGX_HLA_EXTRACT {
+
+    label 'process_high'
+
+    container "${params.sif_dir}/samtools_1.23.1.sif"
+
+    containerOptions "${params.apptainer_base_opts}"
+
+    input:
+    tuple val(sample_id), path(bam), path(bai)
+
+    output:
+    tuple val(sample_id),
+          path("${sample_id}.hla_reads.fastq"),
+          emit: hla_fastq_ch
+
+    script:
+    """
+    echo "[PGX_HLA_EXTRACT] ${sample_id}：擷取 HLA reads" >&2
+
+    # Step 1：chr6 HLA region + 所有 alt contigs
+    samtools view -b -@ ${task.cpus} ${bam} \
+        chr6:29940260-33086201 \
+        chr6_GL000250v2_alt \
+        chr6_GL000251v2_alt \
+        chr6_GL000252v2_alt \
+        chr6_GL000253v2_alt \
+        chr6_GL000254v2_alt \
+        chr6_GL000255v2_alt \
+        chr6_GL000256v2_alt \
+        chr6_GL383533v1_alt \
+        chr6_KB021644v2_alt \
+        chr6_KI270758v1_alt \
+        chr6_KI270797v1_alt \
+        chr6_KI270798v1_alt \
+        chr6_KI270799v1_alt \
+        chr6_KI270800v1_alt \
+        chr6_KI270801v1_alt \
+        chr6_KI270802v1_alt \
+        > hla_region.bam
+
+    # Step 2：unmapped reads（FLAG 0x4）
+    samtools view -b -@ ${task.cpus} -f 4 ${bam} > hla_unmapped.bam
+
+    # Step 3：合併 → single-end fastq（bam2fq，不拆 R1/R2）
+    samtools merge -f -@ ${task.cpus} hla_merged.bam hla_region.bam hla_unmapped.bam
+    samtools bam2fq -@ ${task.cpus} hla_merged.bam > ${sample_id}.hla_reads.fastq
+
+    READ_COUNT=\$(grep -c '^@' ${sample_id}.hla_reads.fastq || echo 0)
+    echo "[PGX_HLA_EXTRACT] HLA reads：\$READ_COUNT（chr6 region + alt contigs + unmapped）" >&2
+    """
+}
+
+// ──────────────────────────────────────────────────────────────
+// Process 2b：OptiType — HLA-A/HLA-B typing（single-end fastq → TSV）
+// ──────────────────────────────────────────────────────────────
+// 容器：optitype_1.3.5.sif（自建，Ubuntu 22.04 + Miniforge）
+//   razers3 3.5.12 + samtools 1.21 + OptiType 1.3.5 + coinor-cbc
+// 為什麼自建：
+//   fred2/optitype:latest → Python 2.7/3.5，razers3 不支援 fastq 輸出
+//   quay.io biocontainers 1.5.0 → Pyomo 6.10 bug，constraint infeasible
+// razers3 -i 90（比預設 97 寬鬆，否則只剩 ~78 reads，B/C locus 無法 call）
 
 process PGX_OPTITYPE {
 
     label 'process_medium'
 
-    container "${params.sif_dir}/optitype_1.0.0.sif"
+    container "${params.sif_dir}/optitype_1.3.5.sif"
 
     containerOptions "${params.apptainer_base_opts}"
 
     publishDir "${params.out_dir}/${sample_id}/07_pgx", mode: 'copy'
 
     input:
-    tuple val(sample_id), path(bam), path(bai)
+    tuple val(sample_id), path(hla_fastq)
 
     output:
     tuple val(sample_id),
@@ -302,55 +377,67 @@ process PGX_OPTITYPE {
 
     script:
     """
-    echo "[PGX_OPTITYPE] ${sample_id}：HLA-A/HLA-B typing" >&2
+    echo "[PGX_OPTITYPE] ${sample_id}：HLA-A/HLA-B typing（OptiType 1.3.5，single-end）" >&2
 
-    # ── Step 1：HLA reads 擷取（razers3）─────────────────────
-    HLA_REF=\$(find /opt /usr -name "hla_reference_dna.fasta" 2>/dev/null | head -1)
+    HLA_REF=\$(find /opt/conda -name "hla_reference_dna.fasta" 2>/dev/null | head -1)
     if [ -z "\$HLA_REF" ]; then
         echo "[PGX_OPTITYPE] 錯誤：找不到 hla_reference_dna.fasta" >&2
         exit 1
     fi
     echo "[PGX_OPTITYPE] HLA reference：\$HLA_REF" >&2
 
-    samtools view -h ${bam} \
-        | razers3 \
-            --percent-identity 90 \
-            --max-hits 1 \
-            --distance-range 0 \
-            --output hla_reads.bam \
-            \$HLA_REF /dev/stdin
+    READ_COUNT=\$(grep -c '^@' ${hla_fastq} || echo 0)
+    echo "[PGX_OPTITYPE] 輸入 reads：\$READ_COUNT" >&2
 
-    samtools fastq hla_reads.bam > hla_reads.fastq
-
-    READ_COUNT=\$(wc -l < hla_reads.fastq)
-    echo "[PGX_OPTITYPE] HLA reads 數：\$((READ_COUNT / 4))" >&2
-
-    if [ "\$((READ_COUNT / 4))" -eq 0 ]; then
+    if [ "\$READ_COUNT" -eq 0 ]; then
         echo "[PGX_OPTITYPE] 警告：沒有 HLA reads，產生空白結果" >&2
         printf "GENE\tALLELE_1\tALLELE_2\tSOURCE\n" > ${sample_id}.optitype.tsv
         printf "HLA-A\t.\t.\tOptiType\n"             >> ${sample_id}.optitype.tsv
         printf "HLA-B\t.\t.\tOptiType\n"             >> ${sample_id}.optitype.tsv
     else
-        # ── Step 2：OptiType typing ─────────────────────────
-        OptiTypePipeline.py \
-            --input hla_reads.fastq \
-            --dna \
-            --outdir optitype_out \
-            --prefix ${sample_id}
+        # ── Step 1：razers3（-i 90）────────────────────────────
+        razers3 \
+            --percent-identity 90 \
+            --max-hits 1 \
+            --distance-range 0 \
+            --thread-count ${task.cpus} \
+            --output hla_mapped.bam \
+            \$HLA_REF \
+            ${hla_fastq}
 
-        RESULT_FILE=\$(find optitype_out -name "*_result.tsv" | head -1)
+        # ── Step 2：BAM → fastq ───────────────────────────────
+        samtools bam2fq hla_mapped.bam > hla_fished.fastq
 
-        if [ -z "\$RESULT_FILE" ]; then
-            echo "[PGX_OPTITYPE] 警告：找不到 OptiType 輸出，產生空白結果" >&2
+        FISHED_COUNT=\$(grep -c '^@' hla_fished.fastq || echo 0)
+        echo "[PGX_OPTITYPE] razers3 過濾後：\$FISHED_COUNT reads" >&2
+
+        if [ "\$FISHED_COUNT" -eq 0 ]; then
+            echo "[PGX_OPTITYPE] 警告：razers3 沒有比對到 reads，產生空白結果" >&2
             printf "GENE\tALLELE_1\tALLELE_2\tSOURCE\n" > ${sample_id}.optitype.tsv
             printf "HLA-A\t.\t.\tOptiType\n"             >> ${sample_id}.optitype.tsv
             printf "HLA-B\t.\t.\tOptiType\n"             >> ${sample_id}.optitype.tsv
         else
-            echo "[PGX_OPTITYPE] 找到結果：\$RESULT_FILE" >&2
-            python3 ${params.scripts_dir}/parse_optitype.py \
-                --input  "\$RESULT_FILE" \
-                --sample ${sample_id} \
-                --output ${sample_id}.optitype.tsv
+            # ── Step 3：OptiType single-end ──────────────────
+            OptiTypePipeline.py \
+                --input hla_fished.fastq \
+                --dna \
+                --outdir optitype_out \
+                --prefix ${sample_id}
+
+            RESULT_FILE=\$(find optitype_out -name "*_result.tsv" | head -1)
+
+            if [ -z "\$RESULT_FILE" ]; then
+                echo "[PGX_OPTITYPE] 警告：找不到 OptiType 輸出，產生空白結果" >&2
+                printf "GENE\tALLELE_1\tALLELE_2\tSOURCE\n" > ${sample_id}.optitype.tsv
+                printf "HLA-A\t.\t.\tOptiType\n"             >> ${sample_id}.optitype.tsv
+                printf "HLA-B\t.\t.\tOptiType\n"             >> ${sample_id}.optitype.tsv
+            else
+                echo "[PGX_OPTITYPE] 找到結果：\$RESULT_FILE" >&2
+                python3 ${params.scripts_dir}/parse_optitype.py \
+                    --input  "\$RESULT_FILE" \
+                    --sample ${sample_id} \
+                    --output ${sample_id}.optitype.tsv
+            fi
         fi
     fi
 
@@ -358,19 +445,6 @@ process PGX_OPTITYPE {
     cat ${sample_id}.optitype.tsv >&2
     """
 }
-
-// ──────────────────────────────────────────────────────────────
-// Process 3：pharmcat_vcf_preprocessor + pharmcat.jar（matcher + phenotyper + reporter）
-// ──────────────────────────────────────────────────────────────
-// pharmcat_pipeline 用法（3.2.0 確認）：
-//   pharmcat_pipeline <input.vcf.gz> \
-//     -s <sample_id> \
-//     -po outside_calls.tsv \         ← outside calls（-po flag，與 pharmcat.jar 相同）
-//     -o <output_dir> \
-//     -bf <basename> \
-//     -rs CPIC,DPWG \                 ← 只輸出 CPIC + DPWG recommendation
-//     -reporterJson \                 ← 輸出 JSON（預設只有 HTML）
-//     -reporterCallsOnlyTsv           ← 額外輸出 calls-only TSV
 
 process PGX_PHARMCAT {
 
@@ -543,24 +617,37 @@ workflow PGX_ANNOTATE {
 
     def no_file = file("NO_FILE")
 
-    // ── WGS：先跑 StellarPGx，再進 PharmCAT ─────────────────
-    // PGX_PHARMCAT input：tuple(sample_id, vcf, tbi, stellarpgx_tsv, optitype_tsv)
-    // WGS 有 stellarpgx，WES 兩個都是 no_file
+    // ── StellarPGx（CYP2D6，WGS only）────────────────────────
     if (params.run_pgx_cyp2d6) {
         bam_only_ch = pgx_wgs_vcf_ch
             .map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, bam, bai) }
         PGX_STELLARPGX(bam_only_ch)
-
-        wgs_pharmcat_ch = pgx_wgs_vcf_ch
-            .map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, vcf, tbi) }
-            .join(PGX_STELLARPGX.out.stellarpgx_ch)
-            .map { sid, vcf, tbi, spgx -> tuple(sid, vcf, tbi, spgx, no_file) }
+        stellarpgx_out_ch = PGX_STELLARPGX.out.stellarpgx_ch
     } else {
-        wgs_pharmcat_ch = pgx_wgs_vcf_ch
-            .map { sid, ptype, vcf, tbi, bam, bai ->
-                tuple(sid, vcf, tbi, no_file, no_file)
-            }
+        stellarpgx_out_ch = pgx_wgs_vcf_ch
+            .map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, no_file) }
     }
+
+    // ── OptiType（HLA-A/HLA-B，WGS only）─────────────────────
+    // PGX_HLA_EXTRACT：BAM → chr6 region + alt contigs + unmapped → single-end fastq
+    // PGX_OPTITYPE：fastq → razers3（-i 90）→ OptiTypePipeline.py（single-end）
+    if (params.run_pgx_hla) {
+        bam_hla_ch = pgx_wgs_vcf_ch
+            .map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, bam, bai) }
+        PGX_HLA_EXTRACT(bam_hla_ch)
+        PGX_OPTITYPE(PGX_HLA_EXTRACT.out.hla_fastq_ch)
+        optitype_out_ch = PGX_OPTITYPE.out.optitype_ch
+    } else {
+        optitype_out_ch = pgx_wgs_vcf_ch
+            .map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, no_file) }
+    }
+
+    // ── 組合 WGS PharmCAT channel（vcf + stellarpgx + optitype）
+    wgs_pharmcat_ch = pgx_wgs_vcf_ch
+        .map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, vcf, tbi) }
+        .join(stellarpgx_out_ch)
+        .join(optitype_out_ch)
+        .map { sid, vcf, tbi, spgx, opty -> tuple(sid, vcf, tbi, spgx, opty) }
 
     // ── WES：直接進 PharmCAT（no outside call）───────────────
     wes_pharmcat_ch = pgx_wes_vcf_ch
