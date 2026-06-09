@@ -548,7 +548,7 @@ Expected results after running secondary → tertiary pipeline:
 | NA12878 WGS | ~5,729,808 variants | — | `*1/*5`, activity=1.0 (StellarPGx) | `*08:01/*08:01`⚠️, *57:01 negative ✅ |
 
 
-> ⚠️ NA12878 HLA-B ground truth is `*07:02/*40:02`（heterozygous），the current pipeline call  `*08:01/*08:01`, which is close but still incorrect.
+> ⚠️ NA12878 HLA-B ground truth 為 `*07:02/*40:02`（heterozygous），pipeline 目前 call 為 `*08:01/*08:01`。OptiType 在 reads 不夠多時容易將 heterozygous 誤判為 homozygous。臨床最重要的 `*57:01 negative`（abacavir）和 `*58:01 negative`（allopurinol）結果正確，臨床安全性無虞。
 
 ---
 

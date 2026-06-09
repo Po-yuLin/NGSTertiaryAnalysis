@@ -314,7 +314,11 @@ process PGX_HLA_EXTRACT {
     """
     echo "[PGX_HLA_EXTRACT] ${sample_id}：擷取 HLA reads" >&2
 
-    # Step 1：chr6 HLA region + 所有 alt contigs
+    # chr6 HLA region（29940260-33086201）+ 16 個 chr6 alt contigs → single-end fastq
+    # unmapped reads 不取：
+    #   NCKUH BWA：unmapped 11.4 萬，chr6 region 181 萬，貢獻 < 6%
+    #   DRAGEN：   unmapped 3000 萬，會讓 razers3 跑 5+ 小時
+    # NCKUH + DRAGEN alt contig 名稱相同（chr6_ prefix，已驗證）
     samtools view -b -@ ${task.cpus} ${bam} \
         chr6:29940260-33086201 \
         chr6_GL000250v2_alt \
@@ -333,17 +337,11 @@ process PGX_HLA_EXTRACT {
         chr6_KI270800v1_alt \
         chr6_KI270801v1_alt \
         chr6_KI270802v1_alt \
-        > hla_region.bam
-
-    # Step 2：unmapped reads（FLAG 0x4）
-    samtools view -b -@ ${task.cpus} -f 4 ${bam} > hla_unmapped.bam
-
-    # Step 3：合併 → single-end fastq（bam2fq，不拆 R1/R2）
-    samtools merge -f -@ ${task.cpus} hla_merged.bam hla_region.bam hla_unmapped.bam
-    samtools bam2fq -@ ${task.cpus} hla_merged.bam > ${sample_id}.hla_reads.fastq
+        | samtools bam2fq -@ ${task.cpus} - \
+        > ${sample_id}.hla_reads.fastq
 
     READ_COUNT=\$(grep -c '^@' ${sample_id}.hla_reads.fastq || echo 0)
-    echo "[PGX_HLA_EXTRACT] HLA reads：\$READ_COUNT（chr6 region + alt contigs + unmapped）" >&2
+    echo "[PGX_HLA_EXTRACT] HLA reads：\$READ_COUNT" >&2
     """
 }
 
@@ -363,7 +361,9 @@ process PGX_OPTITYPE {
 
     container "${params.sif_dir}/optitype_1.3.5.sif"
 
-    containerOptions "${params.apptainer_base_opts}"
+    // --no-home --home /tmp：razers3 底層 seqan library 啟動時嘗試建立 /home/{user}
+    // optitype_1.3.5.sif 雖是自建容器，底層 razers3 仍有同樣問題
+    containerOptions "${params.apptainer_base_opts} --no-home --home /tmp"
 
     publishDir "${params.out_dir}/${sample_id}/07_pgx", mode: 'copy'
 
