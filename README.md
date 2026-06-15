@@ -53,13 +53,15 @@ VCF (nckuh / dragen)                    BAM (WGS only, optional)
 └─────────────────────────────────┘
 
           ┌──────────────────────────────────────────────┐
-          │  PGx Track (WGS + WES, BAM optional)         │
+          │  PGx Track (WGS + WES, BAM required)          │
           │                                              │
           │  WGS:                                        │
           │    BAM → PGX_HLA_EXTRACT (samtools)          │
           │        → PGX_OPTITYPE (razers3 + OptiType)   │
           │          → HLA-A/B allele                    │
-          │    BAM → PGX_STELLARPGX (StellarPGx)         │
+          │    BAM → PGX_GVCF (GATK HC, 1207 PGx sites)  │
+          │    BAM → PGX_MTRN1 (mpileup chrM 3 sites)    │
+          │    BAM → PGX_STELLARPGX (StellarPGx, WGS)    │
           │          → CYP2D6 diplotype (outside call)   │
           │    VCF → pharmcat_vcf_preprocessor           │
           │        → pharmcat.jar -po outside_calls.tsv  │
@@ -283,7 +285,28 @@ APPTAINER_SQUASH_OPTIONS="-processors 1" \
 apptainer build --disable-cache $SIF_DIR/optitype_1.3.5.sif /tmp/optitype_1.3.5.def
 ```
 
-### Step 4 — Clone StellarPGx repo
+### Step 4 — Build PharmCAT positions VCF
+
+GATK HaplotypeCaller needs `pharmcat_positions.vcf.gz` (TBI format) to target only PGx sites:
+
+```bash
+# Extract from PharmCAT container
+apptainer exec /path/to/containers/pharmcat_3.2.0.sif     cat /pharmcat/pharmcat_positions.vcf     > /path/to/reference/tertiary/pharmcat/pharmcat_positions.vcf
+
+conda activate genome
+bgzip /path/to/reference/tertiary/pharmcat/pharmcat_positions.vcf
+tabix -p vcf /path/to/reference/tertiary/pharmcat/pharmcat_positions.vcf.gz
+
+# GATK requires TBI (not CSI) — rebuild index with GATK
+apptainer exec /path/to/containers/gatk_4.6.2.0.sif     gatk IndexFeatureFile         -I /path/to/reference/tertiary/pharmcat/pharmcat_positions.vcf.gz
+
+# Verify: should be 1207 sites
+bcftools view -H /path/to/reference/tertiary/pharmcat/pharmcat_positions.vcf.gz | wc -l
+```
+
+> ⚠️ Do NOT use the `.vcf.bgz` from inside the container — it has a CSI index which GATK cannot use. GATK will silently process only chr1 (87 sites) instead of all 1207 sites.
+
+### Step 5 — Clone StellarPGx repo
 
 StellarPGx requires the full git repo (database, resources, scripts) in addition to the container:
 
@@ -306,91 +329,132 @@ stellarpgx_repo/
 REF_DIR="/path/to/reference/hg38"
 TERTIARY_DIR="${REF_DIR}/tertiary"
 mkdir -p ${TERTIARY_DIR}
+SIF_DIR="/path/to/containers"
+SCRIPTS_DIR="/path/to/NGStertiary/1_0_0/scripts"
+```
 
-# ── VEP cache ──────────────────────────────────────────────────
-mkdir -p ${TERTIARY_DIR}/vep_cache
-cd ${TERTIARY_DIR}/vep_cache
-curl -O https://ftp.ensembl.org/pub/release-115/variation/indexed_vep_cache/homo_sapiens_vep_115_GRCh38.tar.gz
-tar -xzf homo_sapiens_vep_115_GRCh38.tar.gz
+#### VEP cache 115 (~30 GB)
 
-# ── dbNSFP 4.9c ────────────────────────────────────────────────
-mkdir -p ${TERTIARY_DIR}/dbnsfp
-# Download from https://sites.google.com/site/jpopgen/dbNSFP (registration required)
-# File: dbNSFP4.9c_with_pknn_grch38.gz + .tbi
+```bash
+mkdir -p ${TERTIARY_DIR}/vep_cache && cd ${TERTIARY_DIR}/vep_cache
+wget -c https://ftp.ensembl.org/pub/release-115/variation/indexed_vep_cache/homo_sapiens_vep_115_GRCh38.tar.gz
+tar -xzf homo_sapiens_vep_115_GRCh38.tar.gz && rm homo_sapiens_vep_115_GRCh38.tar.gz
+```
 
-# ── LOFTEE ─────────────────────────────────────────────────────
-mkdir -p ${TERTIARY_DIR}/loftee
-# Follow: https://github.com/konradjk/loftee
-# Required: loftee plugin + gerp_conservation_scores.homo_sapiens.GRCh38.bw
+#### dbNSFP 4.9c
 
-# ── ClinVar ────────────────────────────────────────────────────
-mkdir -p ${TERTIARY_DIR}/clinvar
-cd ${TERTIARY_DIR}/clinvar
-wget https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz
-wget https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz.tbi
-# Rename chromosomes to chr-prefixed:
-bcftools annotate --rename-chrs chr_name_conv.txt clinvar.vcf.gz \
-    -O z -o clinvar_20260510.vcf.gz
-tabix -p vcf clinvar_20260510.vcf.gz
-# Build lookup TSV (for fast ClinVar lookup in annotation step):
-python3 scripts/build_clinvar_lookup.py \
-    --input clinvar_20260510.vcf.gz \
-    --output clinvar_lookup.tsv.gz
+Download from https://sites.google.com/site/jpopgen/dbNSFP (free registration required). Place the pre-built `dbNSFP4.9c_with_pknn_grch38.gz` + `.tbi` in `${TERTIARY_DIR}/dbnsfp/`.
 
-# ── gnomAD ─────────────────────────────────────────────────────
-mkdir -p ${TERTIARY_DIR}/gnomad
-# gnomAD v4 genome + exome (large files — download only needed chromosomes)
-# https://gnomad.broadinstitute.org/downloads
+#### LOFTEE data files
 
-# ── Pangolin gene annotation DB ────────────────────────────────
-mkdir -p ${TERTIARY_DIR}/pangolin
-wget https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_47/gencode.v47.annotation.gtf.gz
-# Convert to Pangolin .db format (see Pangolin docs)
+```bash
+mkdir -p ${TERTIARY_DIR}/loftee && cd ${TERTIARY_DIR}/loftee
+wget -c https://personal.broadinstitute.org/konradk/loftee_data/GRCh38/human_ancestor.fa.gz
+wget -c https://personal.broadinstitute.org/konradk/loftee_data/GRCh38/human_ancestor.fa.gz.fai
+wget -c https://personal.broadinstitute.org/konradk/loftee_data/GRCh38/human_ancestor.fa.gz.gzi
+wget -c https://personal.broadinstitute.org/konradk/loftee_data/GRCh38/loftee.sql.gz
+wget -c https://personal.broadinstitute.org/konradk/loftee_data/GRCh38/gerp_conservation_scores.homo_sapiens.GRCh38.bw
+gunzip loftee.sql.gz   # decompress .sql only; keep .fa.gz and .bw compressed
+curl -sL https://raw.githubusercontent.com/Ensembl/VEP_plugins/release/115/LoFtool_scores.txt     -o LoFtool_scores.txt
+```
 
-# ── STRchive ───────────────────────────────────────────────────
-mkdir -p ${TERTIARY_DIR}/strchive
-wget https://raw.githubusercontent.com/dashnowlab/STRchive/main/data/STRchive-loci.json
-# Build lookup tables:
-python3 scripts/build_str_lookup.py \
-    --input STRchive-loci.json \
-    --out_varid str_lookup_varid.tsv.gz \
-    --out_pos str_lookup_pos.tsv.gz
+#### ClinVar
 
-# ── gnomAD mito v3.1（CC0）─────────────────────────────────────
-mkdir -p ${TERTIARY_DIR}/gnomad_mito
-# Download from gnomAD browser: gnomAD v3.1 mitochondrial variants
-python3 scripts/build_gnomad_mito_lookup.py \
-    --input gnomad.genomes.v3.1.sites.chrM.vcf.bgz \
-    --output gnomad_mito_lookup.tsv.gz
+> ⚠️ NCBI ClinVar VCF uses `1`, `2` contig names (no `chr` prefix). Must rename or VEP annotations will all be `.`
 
-# ── AnnotSV annotation databases ───────────────────────────────
-mkdir -p ${TERTIARY_DIR}/annotsv_annotations
-# Follow AnnotSV documentation to install annotation databases
-# https://lbgi.fr/AnnotSV/Documentation
+```bash
+mkdir -p ${TERTIARY_DIR}/clinvar && cd ${TERTIARY_DIR}/clinvar
+# Download a specific dated version (update URL for newer releases)
+wget -c https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/archive_2.0/2026/clinvar_20260510.vcf.gz
+wget -c https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/archive_2.0/2026/clinvar_20260510.vcf.gz.tbi
 
-# ── ClinGen ────────────────────────────────────────────────────
-mkdir -p ${TERTIARY_DIR}/clingen
+# Rename contigs to chr-prefixed
+for i in $(seq 1 22) X Y; do echo "$i chr$i"; done > /tmp/chr_rename.txt
+echo "MT chrM" >> /tmp/chr_rename.txt
+bcftools annotate --rename-chrs /tmp/chr_rename.txt     clinvar_20260510.vcf.gz -Oz -o clinvar_20260510.chr.vcf.gz
+tabix -p vcf clinvar_20260510.chr.vcf.gz
+mv clinvar_20260510.chr.vcf.gz clinvar_20260510.vcf.gz
+mv clinvar_20260510.chr.vcf.gz.tbi clinvar_20260510.vcf.gz.tbi
+
+# Build lookup table (variant_summary for fast annotation)
+wget "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/tab_delimited/archive/variant_summary_2026-05.txt.gz"
+python3 ${SCRIPTS_DIR}/build_clinvar_lookup.py     --input  variant_summary_2026-05.txt.gz     --output clinvar_lookup.tsv.gz
+rm variant_summary_2026-05.txt.gz
+```
+
+#### gnomAD v4.1 genome (~600 GB)
+
+```bash
+mkdir -p ${TERTIARY_DIR}/gnomad && cd ${TERTIARY_DIR}/gnomad
+for chr in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 X Y; do
+    wget -c         "https://storage.googleapis.com/gcp-public-data--gnomad/release/4.1/vcf/genomes/gnomad.genomes.v4.1.sites.chr${chr}.vcf.bgz"         "https://storage.googleapis.com/gcp-public-data--gnomad/release/4.1/vcf/genomes/gnomad.genomes.v4.1.sites.chr${chr}.vcf.bgz.tbi"
+done
+```
+
+#### gnomAD v3.1 mito (CC0 license)
+
+```bash
+mkdir -p ${TERTIARY_DIR}/gnomad_mito && cd ${TERTIARY_DIR}/gnomad_mito
+wget -c "https://storage.googleapis.com/gcp-public-data--gnomad/release/3.1/vcf/genomes/gnomad.genomes.v3.1.sites.chrM.vcf.bgz"
+wget -c "https://storage.googleapis.com/gcp-public-data--gnomad/release/3.1/vcf/genomes/gnomad.genomes.v3.1.sites.chrM.vcf.bgz.tbi"
+apptainer exec --bind ${TERTIARY_DIR} ${SIF_DIR}/tertiary_python_1.0.0.sif     python3 ${SCRIPTS_DIR}/build_gnomad_mito_lookup.py         --vcf    gnomad.genomes.v3.1.sites.chrM.vcf.bgz         --output gnomad_mito_lookup.tsv.gz
+```
+
+#### Pangolin annotation database
+
+```bash
+mkdir -p ${TERTIARY_DIR}/pangolin && cd ${TERTIARY_DIR}/pangolin
+wget -c https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_47/gencode.v47.annotation.gtf.gz
+apptainer exec --bind ${TERTIARY_DIR} ${SIF_DIR}/pangolin_1.0.0.sif     create_db.py     --filter MANE_Select,MANE_Plus_Clinical,Ensembl_canonical     gencode.v47.annotation.gtf.gz
+```
+
+#### STRchive
+
+```bash
+mkdir -p ${TERTIARY_DIR}/strchive && cd ${TERTIARY_DIR}/strchive
+wget -c https://raw.githubusercontent.com/hdashnow/STRchive/main/data/STRchive-loci.json
+python3 ${SCRIPTS_DIR}/build_str_lookup.py     --json         STRchive-loci.json     --output_varid str_lookup_varid.tsv.gz     --output_pos   str_lookup_pos.tsv.gz
+```
+
+#### AnnotSV annotation databases (~2-3 GB)
+
+```bash
+mkdir -p ${TERTIARY_DIR}/annotsv_annotations && cd ${TERTIARY_DIR}/annotsv_annotations
+wget --tries=0 --wait=10 --retry-connrefused     https://www.lbgi.fr/~geoffroy/Annotations/Annotations_Human_3.5.tar.gz
+mkdir -p share/AnnotSV
+tar xzf Annotations_Human_3.5.tar.gz -C share/AnnotSV/
+rm Annotations_Human_3.5.tar.gz
+```
+
+#### ClinGen (PVS1 HI + MOI)
+
+```bash
+mkdir -p ${TERTIARY_DIR}/clingen && cd ${TERTIARY_DIR}/clingen
 wget https://ftp.clinicalgenome.org/ClinGen_gene_curation_list_GRCh38.tsv
-wget "https://search.clinicalgenome.org/kb/gene-validity/download" \
-    -O clingen_gene_disease_validity.csv
-python3 scripts/build_gene_moi.py \
-    --clingen_gene clingen_gene_disease_validity.csv \
-    --output gene_moi.tsv.gz
+wget "https://search.clinicalgenome.org/kb/gene-validity/download"     -O clingen_gene_disease_validity.csv
+python3 ${SCRIPTS_DIR}/build_gene_moi.py     --clingen_gene clingen_gene_disease_validity.csv     --output gene_moi.tsv.gz
 ```
 
-Expected directory structure:
+#### PharmCAT positions VCF (for GATK gVCF step)
+
+See [Step 4](#step-4--build-pharmcat-positions-vcf) above.
+
+Expected directory structure after all downloads:
 ```
-${REF_DIR}/tertiary/
-├── vep_cache/homo_sapiens/115_GRCh38/
-├── dbnsfp/dbNSFP4.9c_with_pknn_grch38.gz(.tbi)
-├── loftee/
-├── clinvar/clinvar_20260510.vcf.gz(.tbi) + clinvar_lookup.tsv.gz
-├── gnomad/
-├── pangolin/gencode.v47.annotation.db
-├── strchive/STRchive-loci.json + str_lookup_varid.tsv.gz + str_lookup_pos.tsv.gz
-├── gnomad_mito/gnomad_mito_lookup.tsv.gz
-├── annotsv_annotations/share/AnnotSV/
-└── clingen/ClinGen_gene_curation_list_GRCh38.tsv + gene_moi.tsv.gz
+${REF_DIR}/
+├── Homo_sapiens_assembly38.fasta(.fai/.dict)  ← from secondary pipeline
+└── tertiary/
+    ├── vep_cache/homo_sapiens/115_GRCh38/
+    ├── dbnsfp/dbNSFP4.9c_with_pknn_grch38.gz(.tbi)
+    ├── loftee/human_ancestor.fa.gz + loftee.sql + gerp_...bw + LoFtool_scores.txt
+    ├── clinvar/clinvar_20260510.vcf.gz(.tbi) + clinvar_lookup.tsv.gz
+    ├── gnomad/gnomad.genomes.v4.1.sites.chr*.vcf.bgz(.tbi)
+    ├── gnomad_mito/gnomad_mito_lookup.tsv.gz
+    ├── pangolin/gencode.v47.annotation.db
+    ├── strchive/STRchive-loci.json + str_lookup_varid.tsv.gz + str_lookup_pos.tsv.gz
+    ├── annotsv_annotations/share/AnnotSV/
+    ├── clingen/ClinGen_gene_curation_list_GRCh38.tsv + gene_moi.tsv.gz
+    └── pharmcat/pharmcat_positions.vcf.gz(.tbi)
 ```
 
 ### Step 6 — Configure pipeline
@@ -480,7 +544,7 @@ nextflow -c nextflow_tertiary.config run main_tertiary.nf \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--pipeline_type` | `null` | Filter samplesheet by pipeline type (`nckuh` / `dragen`) |
-| `--run_pgx` | `true` | Enable PGx module (PharmCAT) |
+| `--run_pgx` | `true` | Enable PGx module (PharmCAT + GATK gVCF + MT-RNR1) |
 | `--run_pgx_cyp2d6` | `true` | Enable StellarPGx CYP2D6 caller (requires BAM, WGS only) |
 | `--run_pgx_hla` | `true` | Enable OptiType HLA-A/B typing (requires BAM, WGS only) |
 
@@ -544,8 +608,8 @@ Expected results after running secondary → tertiary pipeline:
 
 | Sample | SNV/Indel | P/LP | CYP2D6 | HLA-B |
 |--------|-----------|------|--------|-------|
-| NA12878 WES | ~37,199 variants | ~41 LP (low VAF artifact) | VCF-based only | N/A (WES) |
-| NA12878 WGS | ~5,729,808 variants | — | `*1/*5`, activity=1.0 (StellarPGx) | `*08:01/*08:01`⚠️, *57:01 negative ✅ |
+| NA12878 WES | ~37,199 variants | ~41 LP (low VAF artifact) | VCF-based only (17/23 called) | MT-RNR1 Reference LOW |
+| NA12878 WGS | ~5,729,808 variants | — | `*1/*5`, activity=1.0 (StellarPGx) | `*08:01/*08:01`⚠️, *57:01 negative ✅; MT-RNR1 Reference LOW |
 
 
 > ⚠️ NA12878 HLA-B ground truth is `*07:02/*40:02`（heterozygous），the current pipeline call  `*08:01/*08:01`, which is close but still incorrect.

@@ -389,19 +389,19 @@ workflow {
 
         ANNOTSV_SV_NCKUH(nckuh_sv_ch)
 
-        // ── NCKUH BAM channel（PGx CYP2D6/HLA 用）────────────────
-        // StellarPGx 只支援 WGS，WES 樣本直接跳過
+        // ── NCKUH BAM channel（PGx 全樣本，含 WES + WGS）────────
+        // WGS：StellarPGx + OptiType + GATK gVCF
+        // WES：GATK gVCF（StellarPGx/OptiType 在 pgx_annotation.nf 內自動跳過）
         // BAM 路徑：{input_dir}/02_alignment/{sample_id}.aligned.sorted.bam
         bam_ch_pgx = Channel.fromList(samples)
-            .filter { s -> s.seq_type == "WGS" }
             .map { s ->
                 def bam = file("${s.input_dir}/02_alignment/${s.sample_id}.aligned.sorted.bam")
                 def bai = file("${s.input_dir}/02_alignment/${s.sample_id}.aligned.sorted.bam.bai")
                 if (!bam.exists()) {
-                    log.warn "[WARN] 找不到 BAM，CYP2D6/HLA outside call 跳過（PGx 改用 VCF 模式）：${bam}"
+                    log.warn "[WARN] 找不到 BAM，PGx gVCF 跳過（PharmCAT 改用 SNV VCF 模式）：${bam}"
                     return null
                 }
-                tuple(s.sample_id, bam, bai)
+                tuple(s.sample_id, s.seq_type, bam, bai)
             }
             .filter { it != null }
 
@@ -465,7 +465,7 @@ workflow {
         PREPARE_SV_DRAGEN(dragen_sv_ch)
         ANNOTSV_SV_DRAGEN(PREPARE_SV_DRAGEN.out.sv_filtered_ch)
 
-        // ── DRAGEN BAM channel（PGx CYP2D6/HLA 用）──────────────
+        // ── DRAGEN BAM channel（PGx 全樣本，含 WES + WGS）────────
         // DRAGEN 輸出 BAM 路徑依版本可能不同，嘗試兩個慣用路徑
         bam_ch_pgx = Channel.fromList(samples).map { s ->
             def bam = file("${s.input_dir}/bam/${s.sample_id}.bam")
@@ -476,10 +476,10 @@ workflow {
                 bai = file("${s.input_dir}/${s.sample_id}.bam.bai")
             }
             if (!bam.exists()) {
-                log.warn "[WARN] 找不到 DRAGEN BAM，CYP2D6/HLA outside call 跳過（PGx 改用 VCF 模式）：${bam}"
+                log.warn "[WARN] 找不到 DRAGEN BAM，PGx gVCF 跳過（PharmCAT 改用 SNV VCF 模式）：${bam}"
                 return null
             }
-            tuple(s.sample_id, bam, bai)
+            tuple(s.sample_id, s.seq_type, bam, bai)
         }
         .filter { it != null }
     }
@@ -516,15 +516,24 @@ workflow {
         ptype_ch = Channel.fromList(samples)
             .map { s -> tuple(s.sample_id, s.pipeline_type) }
 
-        // WGS：帶 BAM 進去，StellarPGx + OptiType 在 PGX_ANNOTATE 內部跑
+        // bam_ch_pgx = tuple(sid, seq_type, bam, bai)
+        // WGS：帶 BAM 進去，StellarPGx + OptiType + gVCF 在 PGX_ANNOTATE 內部跑
         pgx_wgs_ch = snv_ch
-            .join(bam_ch_pgx)
+            .join(bam_ch_pgx.filter { sid, seq_type, bam, bai -> seq_type == "WGS" })
             .join(ptype_ch)
-            .map { sid, vcf, tbi, bam, bai, ptype ->
+            .map { sid, vcf, tbi, seq_type, bam, bai, ptype ->
                 tuple(sid, ptype, vcf, tbi, bam, bai)
             }
 
-        // WES：沒有 BAM，直接進 PharmCAT（純 VCF 模式）
+        // WES with BAM：有 BAM，跑 gVCF，跳過 StellarPGx/OptiType
+        pgx_wes_bam_ch = snv_ch
+            .join(bam_ch_pgx.filter { sid, seq_type, bam, bai -> seq_type == "WES" })
+            .join(ptype_ch)
+            .map { sid, vcf, tbi, seq_type, bam, bai, ptype ->
+                tuple(sid, ptype, vcf, tbi, bam, bai)
+            }
+
+        // WES without BAM：沒有 BAM，純 VCF 模式
         pgx_wes_ch = snv_ch
             .join(bam_ch_pgx, remainder: true)
             .filter { vals -> vals[3] == null }   // 沒有 BAM 的樣本
@@ -539,7 +548,7 @@ workflow {
 
         PGX_ANNOTATE(
             pgx_wgs_ch,
-            pgx_wes_ch,
+            pgx_wes_bam_ch.mix(pgx_wes_ch),
             MITO_ANNOTATE.out.mito_tsv_ch.ifEmpty(Channel.empty())
         )
     }

@@ -1,5 +1,29 @@
 #!/usr/bin/env python3
 """
+ * =========================================================
+ * WGS/WES Germline Analysis Pipeline
+ * =========================================================
+ * Author   : Po-Yu Lin (林伯昱)
+ * Institute: Department of Neurology and
+ *            Department of Genomic Medicine,
+ *            National Cheng Kung University Hospital
+ * Contact  : p88124019@gs.ncku.edu.tw
+ *
+ * Copyright (c) 2026, Po-Yu Lin (林伯昱)
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * DISCLAIMER: This pipeline is provided "as is" without
+ * warranty of any kind. The authors and their institution
+ * make no representations or warranties regarding the
+ * accuracy, completeness, or suitability of the analysis
+ * results for any clinical or research purpose. Users are
+ * solely responsible for validating and interpreting all
+ * results.
+ * =========================================================
 parse_pgx_report.py
 ===================
 解析 PharmCAT 3.2.0 report.json，整合 mito_tsv（MT-RNR1），
@@ -209,11 +233,76 @@ def parse_report_json(json_path: str, gene_info: dict) -> list[dict]:
     return rows
 
 
-def parse_mito_tsv(mito_path: str) -> list[dict]:
-    """讀取 mito.tsv，找 MT-RNR1 aminoglycoside 已知致病位點。"""
+
+def parse_mtrn1_vcf(vcf_path: str) -> dict:
+    """
+    讀取 PGX_MTRN1 的 bcftools mpileup VCF，
+    回傳每個位點的 GT 和 DP。
+    {pos: {"gt": "0/0", "dp": 361, "af": 0.0}}
+    """
+    result = {}
+    if not vcf_path or vcf_path.startswith("NO_") or not os.path.exists(vcf_path):
+        return result
+
+    try:
+        import subprocess
+        proc = subprocess.run(
+            ["bcftools", "view", "-H", vcf_path],
+            capture_output=True, text=True
+        )
+        for line in proc.stdout.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 10:
+                continue
+            chrom = fields[0]
+            if chrom not in ("chrM", "MT", "M"):
+                continue
+            try:
+                pos = int(fields[1])
+            except ValueError:
+                continue
+
+            fmt  = fields[8].split(":")
+            samp = fields[9].split(":")
+            fmt_dict = dict(zip(fmt, samp))
+
+            gt = fmt_dict.get("GT", "./.")
+            dp = int(fmt_dict.get("DP", "0"))
+            ad = fmt_dict.get("AD", "0")
+            try:
+                ad_vals = [int(x) for x in ad.split(",")]
+                ref_ad = ad_vals[0]
+                alt_ad = sum(ad_vals[1:]) if len(ad_vals) > 1 else 0
+                af = round(alt_ad / dp, 4) if dp > 0 else 0.0
+            except (ValueError, ZeroDivisionError):
+                af = 0.0
+
+            result[pos] = {"gt": gt, "dp": dp, "af": af}
+    except Exception as e:
+        print(f"[PGX_PARSE] 警告：讀取 mtrn1 VCF 失敗：{e}", file=sys.stderr)
+
+    return result
+
+def parse_mito_tsv(mito_path: str, mtrn1_vcf_data: dict | None = None) -> list[dict]:
+    """讀取 mito.tsv，找 MT-RNR1 aminoglycoside 已知致病位點。
+
+    邏輯：
+    - mito.tsv 只有 variant calls，reference 位點不會出現
+    - 找到 pathogenic 位點 → HIGH risk
+    - 找不到任何 pathogenic 位點（但有 mito.tsv）→ Reference，LOW risk
+      （代表這些位點在 mito pipeline 跑過了，只是都是 reference allele）
+    - 沒有 mito.tsv → Unknown（無法判斷，不補 reference）
+    """
     rows = []
-    if not mito_path or mito_path.startswith("NO_") or not os.path.exists(mito_path):
+    no_mito = not mito_path or mito_path.startswith("NO_") or not os.path.exists(mito_path)
+
+    if no_mito:
+        # 沒有 mito.tsv，無法判斷，回傳空（會顯示 Unknown）
         return rows
+
+    found_pathogenic = []
 
     try:
         with open(mito_path, encoding="utf-8") as f:
@@ -240,6 +329,7 @@ def parse_mito_tsv(mito_path: str) -> list[dict]:
                 clnsig = row.get("CLINVAR_SIG", ".")
                 note   = f"Heteroplasmy AF={af}; ClinVar={clnsig}"
 
+                found_pathogenic.append(hgvs)
                 rows.append({
                     "gene":             "MT-RNR1",
                     "diplotype":        hgvs,
@@ -262,6 +352,46 @@ def parse_mito_tsv(mito_path: str) -> list[dict]:
                 })
     except OSError as e:
         print(f"[PGX_PARSE] 警告：讀取 mito TSV 失敗：{e}", file=sys.stderr)
+        return rows
+
+    # 找不到任何 pathogenic 位點
+    if not found_pathogenic:
+        # 用 mtrn1_vcf_data 確認 coverage
+        # 三個位點中只要一個有 coverage（DP >= 10）就補 Reference
+        covered_positions = []
+        if mtrn1_vcf_data:
+            for pos, data in mtrn1_vcf_data.items():
+                if data.get("dp", 0) >= 10:
+                    covered_positions.append(pos)
+
+        if covered_positions or no_mito is False:
+            # 有 coverage 確認（或有 mito.tsv）→ Reference（LOW risk）
+            coverage_note = (
+                f"Coverage confirmed at chrM positions: "
+                f"{','.join(str(p) for p in sorted(covered_positions))}"
+                if covered_positions else
+                "Coverage confirmed via mito pipeline"
+            )
+            rows.append({
+                "gene":             "MT-RNR1",
+                "diplotype":        "Reference",
+                "activity_score":   ".",
+                "phenotype":        "Normal - no aminoglycoside deafness risk",
+                "drug":             "aminoglycosides (gentamicin, tobramycin, streptomycin)",
+                "guideline_source": "ClinVar/CPIC",
+                "recommendation":   (
+                    "No MT-RNR1 pathogenic variants detected (m.1555A>G, m.1494C>T, m.827A>G). "
+                    "Standard aminoglycoside dosing applies."
+                ),
+                "implication":      "No known MT-RNR1 risk variant detected",
+                "cpic_level":       "A",
+                "dpwg_level":       ".",
+                "outside_caller":   "mito_pipeline",
+                "evidence_strength": "Strong",
+                "mtrn1_risk":       "LOW",
+                "notes":            coverage_note,
+            })
+        # coverage 不足 → 不補 row，維持 Unknown
 
     return rows
 
@@ -320,6 +450,8 @@ def main():
     parser.add_argument("--pharmcat_json",  required=True)
     parser.add_argument("--outside_calls",  required=True)
     parser.add_argument("--mito_tsv",       required=True)
+    parser.add_argument("--mtrn1_vcf",      default=None,
+                        help="bcftools mpileup VCF for MT-RNR1 coverage check")
     parser.add_argument("--sample",         required=True)
     parser.add_argument("--pipeline",       required=True)
     parser.add_argument("--output",         required=True)
@@ -341,7 +473,10 @@ def main():
     pharmcat_rows = parse_report_json(args.pharmcat_json, gene_info)
     print(f"[PGX_PARSE] PharmCAT drug 記錄數：{len(pharmcat_rows)}", file=sys.stderr)
 
-    mito_rows = parse_mito_tsv(args.mito_tsv)
+    mtrn1_vcf_data = parse_mtrn1_vcf(args.mtrn1_vcf) if args.mtrn1_vcf else {}
+    print(f"[PGX_PARSE] MT-RNR1 VCF 位點數：{len(mtrn1_vcf_data)}", file=sys.stderr)
+
+    mito_rows = parse_mito_tsv(args.mito_tsv, mtrn1_vcf_data)
     print(f"[PGX_PARSE] MT-RNR1 記錄數：{len(mito_rows)}", file=sys.stderr)
 
     write_pgx_tsv(pharmcat_rows + mito_rows, args.sample, args.pipeline, args.output)

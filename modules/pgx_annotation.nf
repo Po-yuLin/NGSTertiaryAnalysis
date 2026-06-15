@@ -348,6 +348,65 @@ process PGX_HLA_EXTRACT {
 // ──────────────────────────────────────────────────────────────
 // Process 2b：OptiType — HLA-A/HLA-B typing（single-end fastq → TSV）
 // ──────────────────────────────────────────────────────────────
+// Process 3a：GATK HaplotypeCaller（BAM → PGx 位點 gVCF）
+// ──────────────────────────────────────────────────────────────
+// 為什麼需要 gVCF：
+//   ensemble/DRAGEN VCF 只有 variant calls（0/1, 1/1），沒有 reference calls（0/0）
+//   PharmCAT 遇到 VCF 裡沒有的位點無法區分 reference（0/0）vs no-coverage（missing）
+//   結果：大量基因被 call 成 Unknown（CYP2B6, CYP3A4, NUDT15, TPMT 等）
+//   解法：GATK HaplotypeCaller 只跑 PharmCAT 的 1207 個 PGx 位點，輸出含 0/0 的 VCF
+//   來源：PharmCAT 官方文件 https://pharmcat.clinpgx.org/using/VCF-Requirements/
+// 注意：
+//   - pharmcat_positions.vcf.gz 必須用 tabix（TBI），不能用 CSI
+//   - GATK 0/0 位點 QUAL 可能是 "inf" → 換成 "99"（PharmCAT parser 不接受 inf）
+//   - -ip 20 = PharmCAT 官方建議 padding；--max-mnp-distance 1 避免相鄰 SNP 合併成 MNP
+
+process PGX_GVCF {
+
+    label 'process_medium'
+
+    container "${params.sif_dir}/gatk_4.6.2.0.sif"
+
+    containerOptions "${params.apptainer_base_opts}"
+
+    input:
+    tuple val(sample_id), val(pipeline_type), path(snv_vcf), path(snv_tbi), path(bam), path(bai)
+
+    output:
+    tuple val(sample_id), val(pipeline_type),
+          path("${sample_id}.pharmcat.vcf.gz"),
+          path("${sample_id}.pharmcat.vcf.gz.tbi"),
+          emit: gvcf_ch
+
+    script:
+    """
+    echo "[PGX_GVCF] ${sample_id}：GATK HaplotypeCaller（PharmCAT PGx 位點）" >&2
+
+    gatk --java-options "-Xmx${task.memory.toGiga()}g" HaplotypeCaller \
+        -R ${params.ref_fasta} \
+        -I ${bam} \
+        -O ${sample_id}.raw.vcf.gz \
+        -L ${params.pharmcat_positions} \
+        --alleles ${params.pharmcat_positions} \
+        -ip 20 \
+        --max-mnp-distance 1 \
+        --output-mode EMIT_ALL_ACTIVE_SITES \
+        --sample-name ${sample_id}
+
+    # QUAL="inf" → "99"（PharmCAT VCF parser 不接受 inf）
+    bcftools view ${sample_id}.raw.vcf.gz \
+        | awk -F'\t' 'BEGIN{OFS="\t"} /^#/{print; next} \$6=="inf"{\$6="99"; print} \$6!="inf"{print}' \
+        | bgzip -c > ${sample_id}.pharmcat.vcf.gz
+
+    tabix -p vcf ${sample_id}.pharmcat.vcf.gz
+
+    COUNT=\$(bcftools view -H ${sample_id}.pharmcat.vcf.gz | wc -l)
+    echo "[PGX_GVCF] ${sample_id} 完成（\$COUNT 位點）" >&2
+    """
+}
+
+
+// ──────────────────────────────────────────────────────────────
 // 容器：optitype_1.3.5.sif（自建，Ubuntu 22.04 + Miniforge）
 //   razers3 3.5.12 + samtools 1.21 + OptiType 1.3.5 + coinor-cbc
 // 為什麼自建：
@@ -561,6 +620,59 @@ process PGX_PHARMCAT {
 // Process 4：解析 PharmCAT JSON → 臨床用 TSV
 // ──────────────────────────────────────────────────────────────
 
+// ──────────────────────────────────────────────────────────────
+// Process 4a：MT-RNR1 mpileup（BAM → chrM 3 個位點 VCF）
+// ──────────────────────────────────────────────────────────────
+// 為什麼需要 mpileup：
+//   mito.tsv 只有 variant calls，reference 位點不會出現
+//   如果沒有 mpileup，無法區分：
+//     a) 位點是 reference（0/0，無風險）
+//     b) 位點沒有 coverage（無法判斷）
+//   mpileup 只跑 3 個位點（m.1555A>G, m.1494C>T, m.827A>G），< 1 秒
+//   輸出給 parse_pgx_report.py 做 coverage 確認
+//
+// 位點說明（CPIC MT-RNR1 guideline 2022）：
+//   chrM:1555  m.1555A>G  最常見（~1/500），aminoglycoside 致聾
+//   chrM:1494  m.1494C>T  第二常見
+//   chrM:827   m.827A>G   較少見
+
+process PGX_MTRN1 {
+
+    label 'process_low'
+
+    container "${params.sif_dir}/tertiary_python_1.0.0.sif"
+
+    containerOptions "${params.apptainer_base_opts}"
+
+    input:
+    tuple val(sample_id), path(bam), path(bai)
+
+    output:
+    tuple val(sample_id),
+          path("${sample_id}.mtrn1.vcf.gz"),
+          path("${sample_id}.mtrn1.vcf.gz.tbi"),
+          emit: mtrn1_vcf_ch
+
+    script:
+    """
+    echo "[PGX_MTRN1] ${sample_id}：MT-RNR1 位點 mpileup（3 個位點）" >&2
+
+    # region 必須按 coordinate 升序（827 < 1494 < 1555）
+    bcftools mpileup \
+        -f ${params.ref_fasta} \
+        -r chrM:827-827,chrM:1494-1494,chrM:1555-1555 \
+        --annotate AD,DP \
+        ${bam} \
+    | bcftools call -m \
+    | bcftools sort -Oz -o ${sample_id}.mtrn1.vcf.gz
+
+    tabix -p vcf ${sample_id}.mtrn1.vcf.gz
+
+    echo "[PGX_MTRN1] ${sample_id} 完成：" >&2
+    bcftools view -H ${sample_id}.mtrn1.vcf.gz | cut -f1-9 >&2
+    """
+}
+
 process PGX_PARSE {
 
     label 'process_low'
@@ -575,7 +687,9 @@ process PGX_PARSE {
     tuple val(sample_id), val(pipeline_type),
           path(pharmcat_json),
           path(outside_calls_tsv),
-          path(mito_tsv, stageAs: "mito_input.tsv")
+          path(mito_tsv, stageAs: "mito_input.tsv"),
+          path(mtrn1_vcf, stageAs: "mtrn1_input.vcf.gz"),
+          path(mtrn1_tbi, stageAs: "mtrn1_input.vcf.gz.tbi")
 
     output:
     tuple val(sample_id),
@@ -590,6 +704,7 @@ process PGX_PARSE {
         --pharmcat_json   ${pharmcat_json} \
         --outside_calls   ${outside_calls_tsv} \
         --mito_tsv        mito_input.tsv \
+        --mtrn1_vcf       mtrn1_input.vcf.gz \
         --sample          ${sample_id} \
         --pipeline        ${pipeline_type} \
         --output          ${sample_id}.pgx.tsv
@@ -610,12 +725,31 @@ workflow PGX_ANNOTATE {
 
     take:
     pgx_wgs_vcf_ch  // tuple(sample_id, pipeline_type, snv_vcf, snv_tbi, bam, bai)  ← WGS 樣本
-    pgx_wes_vcf_ch  // tuple(sample_id, pipeline_type, snv_vcf, snv_tbi)             ← WES 樣本
+    pgx_wes_vcf_ch  // WES 有 BAM：tuple(sid, ptype, vcf, tbi, bam, bai)
+                    // WES 無 BAM：tuple(sid, ptype, vcf, tbi)
     mito_tsv_ch     // tuple(sample_id, mito_tsv)                                    ← 全樣本
 
     main:
 
     def no_file = file("NO_FILE")
+
+    // ── PGX_GVCF：所有有 BAM 的樣本（WGS + WES with BAM）────
+    // GATK HaplotypeCaller 只跑 PharmCAT 的 1207 個 PGx 位點
+    // 輸出含 0/0 reference call，讓 PharmCAT 區分 reference vs missing
+    // 改善前：大量基因 Unknown（CYP2B6, CYP3A4, NUDT15, TPMT...）
+    // 改善後：幾乎所有基因都能 call 出正確 diplotype
+    wes_with_bam_ch = pgx_wes_vcf_ch.filter { vals -> vals.size() == 6 }
+    all_bam_ch = pgx_wgs_vcf_ch.mix(wes_with_bam_ch)
+    PGX_GVCF(all_bam_ch)
+    // gvcf_ch = tuple(sid, ptype, pharmcat.vcf.gz, .tbi)
+
+    // ── PGX_MTRN1：MT-RNR1 位點 mpileup（所有有 BAM 的樣本）──
+    // bcftools mpileup 只跑 chrM:1555, 1494, 827（< 1 秒）
+    // 確認 coverage 讓 parse_pgx_report.py 區分 reference vs no-coverage
+    mtrn1_bam_ch = all_bam_ch
+        .map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, bam, bai) }
+    PGX_MTRN1(mtrn1_bam_ch)
+    // mtrn1_vcf_ch = tuple(sid, mtrn1.vcf.gz, .tbi)
 
     // ── StellarPGx（CYP2D6，WGS only）────────────────────────
     if (params.run_pgx_cyp2d6) {
@@ -629,8 +763,6 @@ workflow PGX_ANNOTATE {
     }
 
     // ── OptiType（HLA-A/HLA-B，WGS only）─────────────────────
-    // PGX_HLA_EXTRACT：BAM → chr6 region + alt contigs + unmapped → single-end fastq
-    // PGX_OPTITYPE：fastq → razers3（-i 90）→ OptiTypePipeline.py（single-end）
     if (params.run_pgx_hla) {
         bam_hla_ch = pgx_wgs_vcf_ch
             .map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, bam, bai) }
@@ -642,35 +774,50 @@ workflow PGX_ANNOTATE {
             .map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, no_file) }
     }
 
-    // ── 組合 WGS PharmCAT channel（vcf + stellarpgx + optitype）
-    wgs_pharmcat_ch = pgx_wgs_vcf_ch
-        .map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, vcf, tbi) }
+    // ── WGS：gVCF + stellarpgx + optitype → PharmCAT ────────
+    // 只有 WGS 樣本的 sid 才在 stellarpgx_out_ch 和 optitype_out_ch 裡
+    wgs_pharmcat_ch = PGX_GVCF.out.gvcf_ch
+        .join(pgx_wgs_vcf_ch.map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, "wgs_marker") })
+        .map { sid, ptype, gvcf, tbi, marker -> tuple(sid, gvcf, tbi) }
         .join(stellarpgx_out_ch)
         .join(optitype_out_ch)
         .map { sid, vcf, tbi, spgx, opty -> tuple(sid, vcf, tbi, spgx, opty) }
 
-    // ── WES：直接進 PharmCAT（no outside call）───────────────
-    wes_pharmcat_ch = pgx_wes_vcf_ch
+    // ── WES with BAM：gVCF，no outside call ─────────────────
+    wes_bam_pharmcat_ch = PGX_GVCF.out.gvcf_ch
+        .join(wes_with_bam_ch.map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, "wes_marker") })
+        .map { sid, ptype, gvcf, tbi, marker -> tuple(sid, gvcf, tbi, no_file, no_file) }
+
+    // ── WES without BAM：SNV VCF，純 VCF 模式 ──────────────
+    wes_noBAM_pharmcat_ch = pgx_wes_vcf_ch
+        .filter { vals -> vals.size() == 4 }
         .map { sid, ptype, vcf, tbi -> tuple(sid, vcf, tbi, no_file, no_file) }
 
-    // ── 合併 WGS + WES → PGX_PHARMCAT ───────────────────────
-    PGX_PHARMCAT(wgs_pharmcat_ch.mix(wes_pharmcat_ch))
+    // ── 合併所有樣本 → PGX_PHARMCAT ─────────────────────────
+    PGX_PHARMCAT(
+        wgs_pharmcat_ch
+            .mix(wes_bam_pharmcat_ch)
+            .mix(wes_noBAM_pharmcat_ch)
+    )
 
     // ── PGX_PARSE：加上 pipeline_type + mito_tsv ────────────
-    all_vcf_ch = pgx_wgs_vcf_ch
+    all_ptype_ch = pgx_wgs_vcf_ch
         .map { sid, ptype, vcf, tbi, bam, bai -> tuple(sid, ptype) }
-        .mix(pgx_wes_vcf_ch.map { sid, ptype, vcf, tbi -> tuple(sid, ptype) })
+        .mix(pgx_wes_vcf_ch.map { vals -> tuple(vals[0], vals[1]) })
 
-    parse_input_ch = all_vcf_ch
+    parse_input_ch = all_ptype_ch
         .join(PGX_PHARMCAT.out.pharmcat_ch)
         .join(mito_tsv_ch.ifEmpty(Channel.empty()), remainder: true)
+        .join(PGX_MTRN1.out.mtrn1_vcf_ch)
         .map { vals ->
-            def sid   = vals[0]
-            def ptype = vals[1]
-            def json  = vals[2]
-            def ocall = vals[3]
-            def mito  = (vals.size() > 4 && vals[4] != null) ? vals[4] : no_file
-            tuple(sid, ptype, json, ocall, mito)
+            def sid      = vals[0]
+            def ptype    = vals[1]
+            def json     = vals[2]
+            def ocall    = vals[3]
+            def mito     = (vals.size() > 4 && vals[4] != null) ? vals[4] : no_file
+            def mtrn1vcf = vals[5]
+            def mtrn1tbi = vals[6]
+            tuple(sid, ptype, json, ocall, mito, mtrn1vcf, mtrn1tbi)
         }
 
     PGX_PARSE(parse_input_ch)
