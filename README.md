@@ -53,7 +53,7 @@ VCF (nckuh / dragen)                    BAM (WGS only, optional)
 └─────────────────────────────────┘
 
           ┌──────────────────────────────────────────────┐
-          │  PGx Track (WGS + WES, BAM required)          │
+          │  PGx Track (WGS + WES, BAM required)         │
           │                                              │
           │  WGS:                                        │
           │    BAM → PGX_HLA_EXTRACT (samtools)          │
