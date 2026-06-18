@@ -44,7 +44,7 @@ VCF (nckuh / dragen)                    BAM (WGS only, optional)
 │       ↓                         │     │  STR:  GangSTR/ExpansionHunter   │
 │  Pangolin (splice, GPU)         │     │        + STRchive → str.tsv      │
 │       ↓                         │     │                                  │
-│  PARSE_CSQ (61 columns)         │     │  CNV/SV: AnnotSV 3.5.10          │
+│  PARSE_CSQ (60 columns)         │     │  CNV/SV: AnnotSV 3.5.10          │
 │       ↓                         │     │   NCKUH WES  → cnv.annotated.tsv │
 │  ACMG classifier                │     │   NCKUH WGS  → sv.annotated.tsv  │
 │  (ClinGen SVI 2022)             │     │   DRAGEN CNV → cnv.annotated.tsv │

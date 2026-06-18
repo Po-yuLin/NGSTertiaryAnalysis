@@ -95,18 +95,115 @@ def parse_csq_header(vcf_obj) -> list:
     return []
 
 
+# Consequence 嚴重度排序（數字越小越嚴重）
+# 只列出 chrM 常見的 consequence
+_CONSEQUENCE_RANK = {
+    "transcript_ablation":               1,
+    "splice_acceptor_variant":           2,
+    "splice_donor_variant":              2,
+    "stop_gained":                       3,
+    "frameshift_variant":                4,
+    "stop_lost":                         5,
+    "start_lost":                        6,
+    "transcript_amplification":          7,
+    "inframe_insertion":                 8,
+    "inframe_deletion":                  8,
+    "missense_variant":                  9,
+    "protein_altering_variant":          10,
+    "splice_region_variant":             11,
+    "incomplete_terminal_codon_variant": 12,
+    "start_retained_variant":            13,
+    "stop_retained_variant":             13,
+    "synonymous_variant":                14,
+    "coding_sequence_variant":           15,
+    "mature_miRNA_variant":              16,
+    "5_prime_UTR_variant":               17,
+    "3_prime_UTR_variant":               17,
+    "non_coding_transcript_exon_variant": 18,
+    "intron_variant":                    19,
+    "NMD_transcript_variant":            20,
+    "non_coding_transcript_variant":     21,
+    "upstream_gene_variant":             99,
+    "downstream_gene_variant":           99,
+    "TFBS_ablation":                     99,
+    "TFBS_amplification":                99,
+    "TF_binding_site_variant":           99,
+    "regulatory_region_ablation":        99,
+    "regulatory_region_amplification":   99,
+    "feature_elongation":                99,
+    "regulatory_region_variant":         99,
+    "feature_truncation":                99,
+    "intergenic_variant":               100,
+}
+
+# upstream/downstream 等不算實際落在 gene body 內的 consequence
+_FLANKING_CONSEQUENCES = {
+    "upstream_gene_variant",
+    "downstream_gene_variant",
+    "intergenic_variant",
+    "TFBS_ablation",
+    "TFBS_amplification",
+    "TF_binding_site_variant",
+    "regulatory_region_ablation",
+    "regulatory_region_amplification",
+    "feature_elongation",
+    "regulatory_region_variant",
+    "feature_truncation",
+}
+
+
+def _get_worst_csq_rank(tx: dict) -> int:
+    """取一個 transcript 的所有 consequence 中最嚴重的 rank。"""
+    csq_str = tx.get("Consequence", "") or ""
+    terms = [c.strip() for c in csq_str.replace("&", ",").split(",") if c.strip()]
+    if not terms:
+        return 999
+    return min(_CONSEQUENCE_RANK.get(t, 50) for t in terms)
+
+
+def _is_flanking(tx: dict) -> bool:
+    """判斷一個 transcript 是否只有 upstream/downstream 等 flanking consequence。"""
+    csq_str = tx.get("Consequence", "") or ""
+    terms = {c.strip() for c in csq_str.replace("&", ",").split(",") if c.strip()}
+    return bool(terms) and terms.issubset(_FLANKING_CONSEQUENCES)
+
+
 def pick_transcript(csq_list: list, csq_fields: list) -> dict:
+    """
+    選取代表 transcript。
+
+    chrM 基因密度高，同一個位點常同時有：
+    - 實際落在 gene body 的 consequence（如 MT-TL1 non_coding_transcript_exon_variant）
+    - 鄰近基因的 upstream/downstream 標記（如 MT-CO1 upstream_gene_variant）
+
+    選取邏輯：
+    1. 先篩出非 flanking（實際落在 gene body 內）的 transcript
+    2. 在這些裡面選 consequence 最嚴重的
+    3. 若全部都是 flanking → fallback 到 PICK=1，再 fallback 到第一個
+    """
     if not csq_list or not csq_fields:
         return {}
+
     transcripts = []
     for csq_str in csq_list:
         vals = csq_str.split("|")
         while len(vals) < len(csq_fields):
             vals.append("")
         transcripts.append(dict(zip(csq_fields, vals)))
+
+    # Step 1：找實際落在 gene body 內的 transcript
+    gene_body_txs = [tx for tx in transcripts if not _is_flanking(tx)]
+
+    if gene_body_txs:
+        # 選最嚴重的（rank 最小）
+        return min(gene_body_txs, key=_get_worst_csq_rank)
+
+    # Step 2：全部都是 flanking → fallback 到 PICK=1
     for tx in transcripts:
         if tx.get("PICK", "") == "1":
             return tx
+
+    # Step 3：最後 fallback
     return transcripts[0]
 
 

@@ -298,90 +298,147 @@ def get(tx: dict, field: str) -> str:
  
  
 # ──────────────────────────────────────────────────────────────
-# ★ v2.9 新增：代表 transcript 選取邏輯
-# 優先從 MANE Select 中選最嚴重 consequence，fallback 到 PICK=1
+# pick_representative_transcript 和 get_transcript_type 已在
+# v3.2 移除，由 pick_transcripts_for_output 和
+# _get_transcript_type_v32 取代（見下方）
 # ──────────────────────────────────────────────────────────────
  
-def pick_representative_transcript(transcripts: list) -> dict:
+ 
+# ──────────────────────────────────────────────────────────────
+# ★ v3.2：代表 transcript 選取邏輯（按基因分組）
+# ──────────────────────────────────────────────────────────────
+#
+# 設計說明：
+#   v2.9 舊邏輯：把所有基因的 transcript 混在一起，從 MANE Select 選最嚴重的
+#   問題：鄰近基因的 MANE Select（downstream/MODIFIER）可能蓋掉本基因的
+#         HIGH impact transcript（如 SLC37A4 stop_gained 被 TRAPPC4 蓋掉）
+#   根本原因：SLC37A4 的 MANE Select transcript（ENST00000642844）在 alt contig
+#             NW_009646203.1 上，主染色體 annotation 時不會出現，所以
+#             SLC37A4 所有主染色體 transcript 都沒有 MANE_SELECT 標記
+#
+# 新邏輯（v3.2）：
+#   Step 1：按 SYMBOL 分組，每個基因各自選代表 transcript
+#           - 有 MANE_SELECT → 全部留下
+#           - 有 MANE_PLUS_CLINICAL → 全部留下
+#           - 完全沒有 MANE → 依序選一個：
+#             Canonical(YES) > APPRIS_P1 > consequence 最嚴重 > 第一個
+#   Step 2：從所有基因的代表 transcript 中決定最終輸出：
+#           - 所有 MANE（SELECT + PLUS_CLINICAL）都保留
+#           - 非 MANE 的代表：只有 consequence 嚴重度 > 所有 MANE 中最嚴重的才保留
+#             （並列最嚴重時全部保留）
+#   結果：輸出 1 到 N 行，每行是一個代表 transcript 的完整 annotation
+
+def _get_gene_representative_transcripts(gene_txs: list) -> list:
     """
-    選取代表 transcript。
- 
-    選取優先順序：
-    1. MANE Select transcript 中，consequence 最嚴重的
-    2. 無 MANE Select → 用 VEP 原生 PICK=1
-    3. 無 PICK=1 → 第一個 transcript
+    從同一個基因的 transcript 列表中選出代表 transcript。
+    有 MANE 的基因：回傳所有 MANE_SELECT + MANE_PLUS_CLINICAL。
+    沒有 MANE 的基因：回傳一個最佳 transcript。
     """
-    # Step 1：找所有 MANE Select transcript
-    mane_select_txs = [tx for tx in transcripts if tx.get("MANE_SELECT")]
- 
-    if mane_select_txs:
-        # 在 MANE Select 中選 consequence 最嚴重的
-        return min(mane_select_txs, key=get_worst_consequence_rank)
- 
-    # Step 2：無 MANE Select，用 VEP PICK=1
-    picked = [tx for tx in transcripts if tx.get("PICK") == "1"]
-    if picked:
-        return picked[0]
- 
-    # Step 3：最後 fallback
-    return transcripts[0] if transcripts else {}
- 
- 
-# ──────────────────────────────────────────────────────────────
-# TRANSCRIPT_TYPE 判斷
-# ──────────────────────────────────────────────────────────────
- 
-def get_transcript_type(tx: dict) -> str:
+    mane_txs = [tx for tx in gene_txs
+                if tx.get("MANE_SELECT") or tx.get("MANE_PLUS_CLINICAL")]
+    if mane_txs:
+        # 去重（同一 ENST 可能重複）
+        seen = set()
+        result = []
+        for tx in mane_txs:
+            feat = tx.get("Feature", "")
+            if feat not in seen:
+                seen.add(feat)
+                result.append(tx)
+        return result
+
+    # 沒有 MANE → 選一個
+    # 1. Canonical YES
+    canonical = [tx for tx in gene_txs if tx.get("CANONICAL") == "YES"]
+    if canonical:
+        return [min(canonical, key=get_worst_consequence_rank)]
+
+    # 2. APPRIS P1
+    appris_p1 = [tx for tx in gene_txs if tx.get("APPRIS") == "P1"]
+    if appris_p1:
+        return [min(appris_p1, key=get_worst_consequence_rank)]
+
+    # 3. consequence 最嚴重
+    if gene_txs:
+        return [min(gene_txs, key=get_worst_consequence_rank)]
+
+    return []
+
+
+def pick_transcripts_for_output(transcripts: list) -> list:
+    """
+    ★ v3.2 核心函式：從所有 transcript 選出最終輸出的代表 transcript 列表。
+
+    回傳：list of (tx_dict, transcript_type_str)
+    """
+    if not transcripts:
+        return []
+
+    # Step 1：按基因分組，每個基因選代表 transcript
+    gene_groups: dict[str, list] = {}
+    for tx in transcripts:
+        gene = tx.get("SYMBOL") or tx.get("Gene") or "UNKNOWN"
+        gene_groups.setdefault(gene, []).append(tx)
+
+    all_gene_reps = []  # [(tx_dict, is_mane)]
+    for gene, gene_txs in gene_groups.items():
+        reps = _get_gene_representative_transcripts(gene_txs)
+        for tx in reps:
+            is_mane = bool(tx.get("MANE_SELECT") or tx.get("MANE_PLUS_CLINICAL"))
+            all_gene_reps.append((tx, is_mane))
+
+    if not all_gene_reps:
+        return []
+
+    # Step 2：決定最終輸出
+    mane_reps    = [(tx, m) for tx, m in all_gene_reps if m]
+    non_mane_reps = [(tx, m) for tx, m in all_gene_reps if not m]
+
+    # 如果完全沒有 MANE，直接回傳所有基因的代表（最多一個/基因）
+    if not mane_reps:
+        result = []
+        for tx, _ in non_mane_reps:
+            result.append((tx, _get_transcript_type_v32(tx)))
+        return result
+
+    # 計算所有 MANE 中最嚴重的 rank
+    best_mane_rank = min(get_worst_consequence_rank(tx) for tx, _ in mane_reps)
+
+    # 收集輸出
+    result = []
+    seen_enst = set()
+
+    # 所有 MANE 都輸出
+    for tx, _ in mane_reps:
+        feat = tx.get("Feature", "")
+        if feat not in seen_enst:
+            seen_enst.add(feat)
+            result.append((tx, _get_transcript_type_v32(tx)))
+
+    # 非 MANE 代表：只有比所有 MANE 嚴重（rank 更小）才輸出
+    # 允許並列（相同 rank 也輸出）
+    for tx, _ in non_mane_reps:
+        rank = get_worst_consequence_rank(tx)
+        feat = tx.get("Feature", "")
+        if rank < best_mane_rank and feat not in seen_enst:
+            seen_enst.add(feat)
+            result.append((tx, _get_transcript_type_v32(tx)))
+
+    return result
+
+
+def _get_transcript_type_v32(tx: dict) -> str:
+    """v3.2 擴充的 TRANSCRIPT_TYPE 值"""
     if tx.get("MANE_SELECT"):
         return "MANE_SELECT"
     elif tx.get("MANE_PLUS_CLINICAL"):
         return "MANE_PLUS_CLINICAL"
     elif tx.get("CANONICAL") == "YES":
         return "CANONICAL"
-    return "OTHER"
- 
- 
-# ──────────────────────────────────────────────────────────────
-# MANE_ALL JSON 建立
-# ──────────────────────────────────────────────────────────────
- 
-def build_mane_all(transcripts: list) -> str:
-    mane_entries = []
-    seen_tx = set()
- 
-    for tx in transcripts:
-        mane_select = tx.get("MANE_SELECT", "")
-        mane_plus   = tx.get("MANE_PLUS_CLINICAL", "")
-        feature     = tx.get("Feature", "")
- 
-        if feature in seen_tx:
-            continue
- 
-        if mane_select:
-            seen_tx.add(feature)
-            mane_entries.append({
-                "tx":          mane_select,
-                "enst":        feature,
-                "type":        "MANE_SELECT",
-                "consequence": tx.get("Consequence", ""),
-                "hgvsc":       tx.get("HGVSc", ""),
-                "hgvsp":       tx.get("HGVSp", ""),
-                "impact":      tx.get("IMPACT", ""),
-            })
- 
-        if mane_plus and feature not in seen_tx:
-            seen_tx.add(feature)
-            mane_entries.append({
-                "tx":          mane_plus,
-                "enst":        feature,
-                "type":        "MANE_PLUS_CLINICAL",
-                "consequence": tx.get("Consequence", ""),
-                "hgvsc":       tx.get("HGVSc", ""),
-                "hgvsp":       tx.get("HGVSp", ""),
-                "impact":      tx.get("IMPACT", ""),
-            })
- 
-    return json.dumps(mane_entries, ensure_ascii=False) if mane_entries else "[]"
+    elif tx.get("APPRIS") == "P1":
+        return "APPRIS_P1"
+    else:
+        return "BEST_CONSEQUENCE"
  
  
 # ──────────────────────────────────────────────────────────────
@@ -482,7 +539,6 @@ OUTPUT_COLUMNS = [
     "GENE", "TRANSCRIPT", "TRANSCRIPT_TYPE",
     "HGVS_C", "HGVS_P", "CONSEQUENCE", "IMPACT",
     "EXON", "INTRON",
-    "MANE_ALL",
     # Caller 資訊
     "CALLERS", "DP_DV", "AD_DV", "VAF_DV", "DP_HC", "AD_HC",
     "ZYGOSITY", "GT_DV", "GT_HC",
@@ -620,72 +676,13 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
                            if idx < len(vals)}
                 transcripts.append(tx_dict)
  
-            # ★ v2.9：從 MANE Select 中選最嚴重 consequence 的代表 transcript
-            picked_tx = pick_representative_transcript(transcripts)
+            # ★ v3.2：按基因分組選代表 transcript，輸出多行
+            picked_txs = pick_transcripts_for_output(transcripts)
+            if not picked_txs:
+                skipped += 1
+                continue
 
-            # ClinVar（VEP --custom annotation，在 VCF 格式下放在 CSQ 欄位內）
-            # 注意：VCF 格式的 VEP 輸出，custom annotation 不在 top-level INFO，
-            #       而是在每個 transcript 的 CSQ pipe-separated 欄位裡
-            clinvar_sig     = get(picked_tx, "ClinVar_CLNSIG")
-            clinvar_revstat = get(picked_tx, "ClinVar_CLNREVSTAT")
-            clinvar_dn      = get(picked_tx, "ClinVar_CLNDN")
-            clinvar_sigconf = get(picked_tx, "ClinVar_CLNSIGCONF")
-            clinvar_stars   = clnrevstat_to_stars(clinvar_revstat)
-
-            # 從代表 transcript 提取欄位
-            gene            = get(picked_tx, "SYMBOL")
-            transcript      = get(picked_tx, "Feature")
-            transcript_type = get_transcript_type(picked_tx)
-            hgvs_c          = get(picked_tx, "HGVSc")
-            hgvs_p          = get(picked_tx, "HGVSp")
-            consequence     = get(picked_tx, "Consequence")
-            impact          = get(picked_tx, "IMPACT")
-            exon            = get(picked_tx, "EXON")
-            intron          = get(picked_tx, "INTRON")
- 
-            # ★ v2.9：rsID（從 Existing_variation 提取）
-            existing_var = get(picked_tx, "Existing_variation")
-            rs_id_vep    = extract_rs_id(existing_var)
- 
-            # 族群頻率
-            gnomad_g_af     = get(picked_tx, "gnomADg_AF")
-            gnomad_g_eas_af = get(picked_tx, "gnomADg_EAS_AF")
-            gnomad_e_af     = get(picked_tx, "gnomADe_AF")
-            gnomad_e_eas_af = get(picked_tx, "gnomADe_EAS_AF")
-            gnomad_e_af_db      = get(picked_tx, "gnomAD_exomes_AF")
-            gnomad_e_eas_af_db  = get(picked_tx, "gnomAD_exomes_EAS_AF")
-            tg_eas_af       = get(picked_tx, "EAS_AF")   # ★ v2.9：1000G EAS
- 
-            # LOFTEE
-            loftee        = get(picked_tx, "LoF")
-            loftee_filter = get(picked_tx, "LoF_filter")
-            loftee_flags  = get(picked_tx, "LoF_flags")
-            loftool       = get(picked_tx, "LoFtool")
- 
-            # In silico scores
-            bayesdel_noaf      = get(picked_tx, "BayesDel_noAF_score")
-            bayesdel_noaf_pred = get(picked_tx, "BayesDel_noAF_pred")
-            alphamissense      = get(picked_tx, "AlphaMissense_score")
-            alphamissense_pred = get(picked_tx, "AlphaMissense_pred")
-            esm1b              = get(picked_tx, "ESM1b_score")
-            esm1b_pred         = get(picked_tx, "ESM1b_pred")
-            varity_r           = get(picked_tx, "VARITY_R_score")
-            sift               = get(picked_tx, "SIFT_score")
-            sift_pred          = get(picked_tx, "SIFT_pred")
-            dann               = get(picked_tx, "DANN_score")
-            phactboost         = get(picked_tx, "PHACTboost_score")
-            phylop100          = get(picked_tx, "phyloP100way_vertebrate")
-            gerp               = get(picked_tx, "GERP++_RS")
-            pknn_llr           = get(picked_tx, "PKNN_LLR")
-            pknn_evidence      = llr_to_evidence(pknn_llr)
-            domains            = get(picked_tx, "DOMAINS")
-            swissprot          = get(picked_tx, "SWISSPROT")
-            hgnc_id            = get(picked_tx, "HGNC_ID")   # ★ v3.1：VEP 內建，--symbol 旗標
- 
-            # MANE_ALL JSON
-            mane_all = build_mane_all(transcripts)
- 
-            # Pangolin 分數
+            # Pangolin 和 ClinVar 是 variant-level，所有 transcript 行共用
             alt_first = alt.split(",")[0]
             pang_key = (chrom, pos, ref, alt_first)
             if pang_key in pangolin_scores:
@@ -695,93 +692,137 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
             else:
                 pangolin_score  = "."
                 pangolin_detail = "."
- 
-            # ★ v2.9：ClinVar lookup 查表
+
             lookup_key = f"{chrom}:{pos}:{ref}:{alt_first}"
             if lookup_key in clinvar_lookup:
                 cv_varid, cv_omim, cv_rs = clinvar_lookup[lookup_key]
             else:
                 cv_varid, cv_omim, cv_rs = ".", ".", "."
- 
-            # rsID：優先用 lookup，備用 VEP 的 Existing_variation
+
+            # rsID 和 ClinVar 從第一個 transcript 取（variant-level annotation）
+            first_tx = picked_txs[0][0]
+            rs_id_vep = extract_rs_id(get(first_tx, "Existing_variation"))
             rs_id = cv_rs if cv_rs != "." else rs_id_vep
- 
-            # 組裝 row dict（供過濾邏輯使用）
-            row_dict = {
-                "CHROM":                chrom,
-                "POS":                  pos,
-                "REF":                  ref,
-                "ALT":                  alt,
-                "RS_ID":                rs_id,
-                "GENE":                 gene,
-                "TRANSCRIPT":           transcript,
-                "TRANSCRIPT_TYPE":      transcript_type,
-                "HGVS_C":               hgvs_c,
-                "HGVS_P":               hgvs_p,
-                "CONSEQUENCE":          consequence,
-                "IMPACT":               impact,
-                "EXON":                 exon,
-                "INTRON":               intron,
-                "MANE_ALL":             mane_all,
-                "CALLERS":              callers,
-                "DP_DV":                dp_dv,
-                "AD_DV":                ad_dv,
-                "VAF_DV":               vaf_dv,
-                "DP_HC":                dp_hc,
-                "AD_HC":                ad_hc,
-                "ZYGOSITY":             zygosity,
-                "GT_DV":                gt_dv,
-                "GT_HC":                gt_hc,
-                "GNOMAD_G_AF":          gnomad_g_af,
-                "GNOMAD_G_EAS_AF":      gnomad_g_eas_af,
-                "GNOMAD_E_AF":          gnomad_e_af,
-                "GNOMAD_E_EAS_AF":      gnomad_e_eas_af,
-                "GNOMAD_E_AF_DBNSFP":   gnomad_e_af_db,
-                "GNOMAD_E_EAS_AF_DBNSFP": gnomad_e_eas_af_db,
-                "TG_EAS_AF":            tg_eas_af,
-                "CLINVAR_SIG":          clinvar_sig,
-                "CLINVAR_STARS":        str(clinvar_stars),
-                "CLINVAR_DN":           clinvar_dn,
-                "CLINVAR_SIGCONF":      clinvar_sigconf,
-                "CLINVAR_VARIATION_ID": cv_varid,
-                "OMIM_IDS":             cv_omim,
-                "LOFTEE":               loftee,
-                "LOFTEE_FILTER":        loftee_filter,
-                "LOFTEE_FLAGS":         loftee_flags,
-                "LOFTOOL":              loftool,
-                "BAYESDEL_NOAF":        bayesdel_noaf,
-                "BAYESDEL_NOAF_PRED":   bayesdel_noaf_pred,
-                "ALPHAMISSENSE":        alphamissense,
-                "ALPHAMISSENSE_PRED":   alphamissense_pred,
-                "ESM1B":                esm1b,
-                "ESM1B_PRED":           esm1b_pred,
-                "VARITY_R":             varity_r,
-                "SIFT":                 sift,
-                "SIFT_PRED":            sift_pred,
-                "DANN":                 dann,
-                "PHACTBOOST":           phactboost,
-                "PHYLOP100":            phylop100,
-                "GERP":                 gerp,
-                "PKNN_LLR":             pknn_llr,
-                "PKNN_EVIDENCE":        pknn_evidence,
-                "PANGOLIN_SCORE":       pangolin_score,
-                "PANGOLIN_DETAIL":      pangolin_detail,
-                "DOMAINS":              domains,
-                "SWISSPROT":            swissprot,
-                "HGNC_ID":              hgnc_id,   # ★ v3.1
-            }
- 
-            # 輸出 row
-            row_str = "\t".join(row_dict[col] for col in OUTPUT_COLUMNS) + "\n"
- 
-            # full 版本：全部寫入
-            fout_full.write(row_str)
-            written_full += 1
- 
-            # filtered 版本：過濾後寫入
-            if not should_filter(row_dict):
-                fout_filtered.write(row_str)
-                written_filtered += 1
+            clinvar_sig     = get(first_tx, "ClinVar_CLNSIG")
+            clinvar_revstat = get(first_tx, "ClinVar_CLNREVSTAT")
+            clinvar_dn      = get(first_tx, "ClinVar_CLNDN")
+            clinvar_sigconf = get(first_tx, "ClinVar_CLNSIGCONF")
+            clinvar_stars   = clnrevstat_to_stars(clinvar_revstat)
+
+            # 每個代表 transcript 各輸出一行
+            for picked_tx, transcript_type in picked_txs:
+
+                gene       = get(picked_tx, "SYMBOL")
+                transcript = get(picked_tx, "Feature")
+                hgvs_c     = get(picked_tx, "HGVSc")
+                hgvs_p     = get(picked_tx, "HGVSp")
+                consequence= get(picked_tx, "Consequence")
+                impact     = get(picked_tx, "IMPACT")
+                exon       = get(picked_tx, "EXON")
+                intron     = get(picked_tx, "INTRON")
+
+                gnomad_g_af        = get(picked_tx, "gnomADg_AF")
+                gnomad_g_eas_af    = get(picked_tx, "gnomADg_EAS_AF")
+                gnomad_e_af        = get(picked_tx, "gnomADe_AF")
+                gnomad_e_eas_af    = get(picked_tx, "gnomADe_EAS_AF")
+                gnomad_e_af_db     = get(picked_tx, "gnomAD_exomes_AF")
+                gnomad_e_eas_af_db = get(picked_tx, "gnomAD_exomes_EAS_AF")
+                tg_eas_af          = get(picked_tx, "EAS_AF")
+
+                loftee        = get(picked_tx, "LoF")
+                loftee_filter = get(picked_tx, "LoF_filter")
+                loftee_flags  = get(picked_tx, "LoF_flags")
+                loftool       = get(picked_tx, "LoFtool")
+
+                bayesdel_noaf      = get(picked_tx, "BayesDel_noAF_score")
+                bayesdel_noaf_pred = get(picked_tx, "BayesDel_noAF_pred")
+                alphamissense      = get(picked_tx, "AlphaMissense_score")
+                alphamissense_pred = get(picked_tx, "AlphaMissense_pred")
+                esm1b              = get(picked_tx, "ESM1b_score")
+                esm1b_pred         = get(picked_tx, "ESM1b_pred")
+                varity_r           = get(picked_tx, "VARITY_R_score")
+                sift               = get(picked_tx, "SIFT_score")
+                sift_pred          = get(picked_tx, "SIFT_pred")
+                dann               = get(picked_tx, "DANN_score")
+                phactboost         = get(picked_tx, "PHACTboost_score")
+                phylop100          = get(picked_tx, "phyloP100way_vertebrate")
+                gerp               = get(picked_tx, "GERP++_RS")
+                pknn_llr           = get(picked_tx, "PKNN_LLR")
+                pknn_evidence      = llr_to_evidence(pknn_llr)
+                domains            = get(picked_tx, "DOMAINS")
+                swissprot          = get(picked_tx, "SWISSPROT")
+                hgnc_id            = get(picked_tx, "HGNC_ID")
+
+                row_dict = {
+                    "CHROM":                chrom,
+                    "POS":                  pos,
+                    "REF":                  ref,
+                    "ALT":                  alt,
+                    "RS_ID":                rs_id,
+                    "GENE":                 gene,
+                    "TRANSCRIPT":           transcript,
+                    "TRANSCRIPT_TYPE":      transcript_type,
+                    "HGVS_C":               hgvs_c,
+                    "HGVS_P":               hgvs_p,
+                    "CONSEQUENCE":          consequence,
+                    "IMPACT":               impact,
+                    "EXON":                 exon,
+                    "INTRON":               intron,
+                    "CALLERS":              callers,
+                    "DP_DV":                dp_dv,
+                    "AD_DV":                ad_dv,
+                    "VAF_DV":               vaf_dv,
+                    "DP_HC":                dp_hc,
+                    "AD_HC":                ad_hc,
+                    "ZYGOSITY":             zygosity,
+                    "GT_DV":                gt_dv,
+                    "GT_HC":                gt_hc,
+                    "GNOMAD_G_AF":          gnomad_g_af,
+                    "GNOMAD_G_EAS_AF":      gnomad_g_eas_af,
+                    "GNOMAD_E_AF":          gnomad_e_af,
+                    "GNOMAD_E_EAS_AF":      gnomad_e_eas_af,
+                    "GNOMAD_E_AF_DBNSFP":   gnomad_e_af_db,
+                    "GNOMAD_E_EAS_AF_DBNSFP": gnomad_e_eas_af_db,
+                    "TG_EAS_AF":            tg_eas_af,
+                    "CLINVAR_SIG":          clinvar_sig,
+                    "CLINVAR_STARS":        str(clinvar_stars),
+                    "CLINVAR_DN":           clinvar_dn,
+                    "CLINVAR_SIGCONF":      clinvar_sigconf,
+                    "CLINVAR_VARIATION_ID": cv_varid,
+                    "OMIM_IDS":             cv_omim,
+                    "LOFTEE":               loftee,
+                    "LOFTEE_FILTER":        loftee_filter,
+                    "LOFTEE_FLAGS":         loftee_flags,
+                    "LOFTOOL":              loftool,
+                    "BAYESDEL_NOAF":        bayesdel_noaf,
+                    "BAYESDEL_NOAF_PRED":   bayesdel_noaf_pred,
+                    "ALPHAMISSENSE":        alphamissense,
+                    "ALPHAMISSENSE_PRED":   alphamissense_pred,
+                    "ESM1B":                esm1b,
+                    "ESM1B_PRED":           esm1b_pred,
+                    "VARITY_R":             varity_r,
+                    "SIFT":                 sift,
+                    "SIFT_PRED":            sift_pred,
+                    "DANN":                 dann,
+                    "PHACTBOOST":           phactboost,
+                    "PHYLOP100":            phylop100,
+                    "GERP":                 gerp,
+                    "PKNN_LLR":             pknn_llr,
+                    "PKNN_EVIDENCE":        pknn_evidence,
+                    "PANGOLIN_SCORE":       pangolin_score,
+                    "PANGOLIN_DETAIL":      pangolin_detail,
+                    "DOMAINS":              domains,
+                    "SWISSPROT":            swissprot,
+                    "HGNC_ID":              hgnc_id,
+                }
+
+                row_str = "\t".join(row_dict[col] for col in OUTPUT_COLUMNS) + "\n"
+                fout_full.write(row_str)
+                written_full += 1
+
+                if not should_filter(row_dict):
+                    fout_filtered.write(row_str)
+                    written_filtered += 1
  
     filtered_out = written_full - written_filtered
     print(f"[parse_vep_csq] 完成", file=sys.stderr)
