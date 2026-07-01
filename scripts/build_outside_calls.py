@@ -57,6 +57,32 @@ import os
 import sys
 
 
+def is_valid_pharmcat_diplotype(value: str) -> bool:
+    """
+    檢查 StellarPGx 回傳的 diplotype 是否為 PharmCAT 可接受格式。
+
+    PharmCAT 要求 CYP2D6 diplotype 必須是 *allele/*allele 格式（如 *1/*2）。
+    StellarPGx 在某些情況下會回傳警告文字（如 "Possible novel allele..."）
+    而非合法 diplotype，直接寫入會導致 PharmCAT BadOutsideCallException。
+
+    合法 diplotype 特徵：
+      - 包含 "/"（分隔兩個 allele）
+      - 不含空格（警告文字通常很長且有空格）
+      - 以 "*" 開頭（CYP2D6 allele 格式）
+    """
+    value = (value or "").strip()
+    if not value:
+        return False
+    if "/" not in value:
+        return False
+    if " " in value:
+        # 警告文字如 "Possible novel allele or suballele present: ..."
+        return False
+    if not value.startswith("*"):
+        return False
+    return True
+
+
 def parse_stellarpgx(path: str) -> dict | None:
     """解析 StellarPGx TSV，回傳 CYP2D6 diplotype 資訊。"""
     if not path or path.startswith("NO_") or not os.path.exists(path):
@@ -76,12 +102,23 @@ def parse_stellarpgx(path: str) -> dict | None:
                 activity  = row.get("ACTIVITY_SCORE", ".")
                 phenotype = row.get("PHENOTYPE", ".")
 
-                if gene == "CYP2D6" and diplotype not in ("Unknown", "."):
-                    return {
-                        "diplotype": diplotype,
-                        "activity":  activity if activity != "." else "",
-                        "phenotype": phenotype if phenotype not in (".", "Indeterminate") else "",
-                    }
+                if gene != "CYP2D6":
+                    continue
+
+                if not is_valid_pharmcat_diplotype(diplotype):
+                    # StellarPGx 回傳警告文字或非法格式（如 "Possible novel allele..."）
+                    # 不寫入 PharmCAT outside calls，避免 BadOutsideCallException
+                    print(
+                        f"[BUILD_OUTSIDE_CALLS] CYP2D6 diplotype 不合法，跳過 outside call：{diplotype!r}",
+                        file=sys.stderr
+                    )
+                    return None
+
+                return {
+                    "diplotype": diplotype,
+                    "activity":  activity if activity != "." else "",
+                    "phenotype": phenotype if phenotype not in (".", "Indeterminate") else "",
+                }
     except OSError as e:
         print(f"[BUILD_OUTSIDE_CALLS] 警告：讀取 StellarPGx 失敗：{e}", file=sys.stderr)
 
