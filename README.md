@@ -627,17 +627,19 @@ This pipeline is released under the [GNU General Public License v3](LICENSE) (GP
 | [Nextflow](https://github.com/nextflow-io/nextflow) | ≥ 23.x | Apache 2.0 | |
 | [Apptainer](https://github.com/apptainer/apptainer) | ≥ 1.x | BSD 3-Clause | |
 | [VEP](https://github.com/Ensembl/ensembl-vep) | 115 | Apache 2.0 | |
-| [Pangolin](https://github.com/tkzeng/Pangolin) | custom | BSD | |
+| [Pangolin](https://github.com/tkzeng/Pangolin) | custom | GPL-3.0 | commercial use OK (copyleft) |
 | [AnnotSV](https://github.com/lgmgeo/AnnotSV) | 3.5.10 | GNU GPL v3 | |
 | [PharmCAT](https://github.com/PharmGKB/PharmCAT) | 3.2.0 | MPL 2.0 | |
-| [StellarPGx](https://github.com/SBIMB/StellarPGx) | 1.2.8 | Open source | Graphtyper 2.5.1 |
+| [StellarPGx](https://github.com/SBIMB/StellarPGx) | 1.2.8 | MIT | + Graphtyper 2.5.1 (MIT) |
 | [OptiType](https://github.com/FRED-2/OptiType) | 1.3.5 | BSD 3-Clause | 自建 sif（Ubuntu 22.04 + Miniforge）|
 | [SAMtools](https://github.com/samtools/samtools) | 1.23.1 | MIT | |
 | [BCFtools](https://github.com/samtools/bcftools) | 1.23.1 | MIT | |
 | [gnomAD v3.1 mito](https://gnomad.broadinstitute.org) | 3.1 | CC0 | Replaces MITOMAP (CC BY-NC) |
 | [ClinVar](https://www.ncbi.nlm.nih.gov/clinvar/) | — | Public domain | |
 | [STRchive](https://strchive.org) | — | CC BY 4.0 | |
-| [PharmVar / CPIC](https://www.cpicpgx.org) | — | CC0 | |
+| [CPIC](https://cpicpgx.org) | — | CC0 | consumed via PharmCAT |
+| [PharmVar](https://www.pharmvar.org) | — | CC BY-NC-ND ⚠️ | non-commercial; used only indirectly (CPIC / StellarPGx DB), never downloaded directly |
+| [PharmGKB / DPWG](https://www.pharmgkb.org) | — | CC BY-SA 4.0 ⚠️ | attribution + ShareAlike; confirm fee-for-service terms with legal |
 | [ClinGen](https://clinicalgenome.org) | — | CC0 | |
 | Aldy | — | Non-commercial only | ❌ **Not used** |
 | BCyrius | — | PolyForm Strict | ❌ **Not used** |

@@ -54,17 +54,20 @@ process ADD_DRAGEN_TAG {
 
     script:
     """
-    # Step 1：確保 .tbi 存在（DRAGEN 輸出有時不含 index）
-    if [ ! -f "${dragen_vcf}.tbi" ]; then
-        echo "[ADD_DRAGEN_TAG] 建立 tabix index..." >&2
-        tabix -p vcf ${dragen_vcf}
-    fi
+    # Step 1：正規化 + 拆分多等位基因（left-align + split multiallelics）
+    #   讓每個 ALT 各自一列，使 AD/VAF 與後續 VEP / gnomAD / ClinVar 註解 per-allele 正確。
+    #   DRAGEN VCF 多半已正規化，再跑一次為冪等、無害。
+    #   -c w：REF 與參考不符時只警告不中斷。
+    bcftools norm -m -any -f ${params.ref_fasta} -c w \\
+        ${dragen_vcf} \\
+        -Oz -o ${sample_id}.norm.vcf.gz
+    tabix -p vcf ${sample_id}.norm.vcf.gz
 
-    # Step 2：add_dragen_tag.py
+    # Step 2：add_dragen_tag.py（吃正規化後的 biallelic VCF）
     #   - 新增 INFO tag：CALLERS, DP_DRAGEN, AD_DRAGEN, VAF_DRAGEN, GQ_DRAGEN
     #   - 分流：SNV（PASS，非 chrM）→ snv_raw.vcf；Mito（chrM 全部）→ mito_raw.vcf
     python3 ${params.scripts_dir}/add_dragen_tag.py \\
-        --input       ${dragen_vcf} \\
+        --input       ${sample_id}.norm.vcf.gz \\
         --sample      ${sample_id} \\
         --output_snv  ${sample_id}.snv_raw.vcf \\
         --output_mito ${sample_id}.mito_raw.vcf

@@ -80,10 +80,18 @@ process ADD_CALLERS_TAG {
 
     script:
     """
-    # 執行 add_callers_tag.py
+    # 先正規化 + 拆分多等位基因（left-align + split multiallelics）。
+    # 讓每個 ALT 各自一列，使 CALLERS/AD/VAF 以及後續 VEP / gnomAD / ClinVar 註解
+    # 都是 per-allele 正確（避免多等位基因位點把不同 allele 的 AF / 致病性混在一起）。
+    # -c w：REF 與參考不符時只警告不中斷（同一 hg38 參考下通常不會發生）。
+    bcftools norm -m -any -f ${params.ref_fasta} -c w \\
+        ${ensemble_vcf} \\
+        -Oz -o ${sample_id}.norm.vcf.gz
+
+    # 執行 add_callers_tag.py（吃正規化後的 biallelic VCF）
     # --sample 傳入 sample_id，腳本會自動尋找 {sample_id}_DV 和 {sample_id}_HC column
     python3 ${params.scripts_dir}/add_callers_tag.py \\
-        --input  ${ensemble_vcf} \\
+        --input  ${sample_id}.norm.vcf.gz \\
         --sample ${sample_id} \\
         --output ${sample_id}.callers_tagged.vcf
     """

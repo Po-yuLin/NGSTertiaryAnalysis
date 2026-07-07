@@ -149,23 +149,28 @@ def clnrevstat_to_stars(revstat: str) -> int:
  
 def infer_zygosity(gt_dv: str, gt_hc: str, chrom: str) -> str:
     gt = gt_dv if gt_dv not in (".", "./.", ".|.") else gt_hc
-    if gt in (".", "./.", ".|."):
+    if gt in (".", "./.", ".|.", ""):
         return "unknown"
     gt_norm = gt.replace("|", "/")
-    alleles = gt_norm.split("/")
-    if len(alleles) != 2:
+    # 去掉 missing allele（拆分多等位基因後可能出現半缺失，如 1/.）
+    called = [a for a in gt_norm.split("/") if a != "."]
+    if not called:
         return "unknown"
-    ref_count = alleles.count("0")
-    alt_alleles = [a for a in alleles if a not in ("0", ".")]
-    if ref_count == 2:
+    is_sex = chrom in ("chrX", "chrY", "X", "Y")
+    alt_alleles = [a for a in called if a != "0"]
+    if not alt_alleles:
         return "ref"
-    elif ref_count == 0 and len(alt_alleles) == 2:
-        if chrom in ("chrX", "chrY", "X", "Y"):
+    # haploid 或拆分後只剩單一有效 allele（例如 1/. → 該 ALT 僅一份）
+    if len(called) == 1:
+        return "hemizygous" if is_sex else "het"
+    # 二倍體且兩個都是 ALT
+    if "0" not in called:
+        if is_sex:
             return "hemizygous"
-        return "hom"
-    elif ref_count == 1:
-        return "het"
-    return "unknown"
+        # 1/1（相同 ALT）→ hom；1/2（不同 ALT，複合雜合）→ het
+        return "hom" if len(set(alt_alleles)) == 1 else "het"
+    # 一 ref 一 alt
+    return "het"
  
  
 # ──────────────────────────────────────────────────────────────

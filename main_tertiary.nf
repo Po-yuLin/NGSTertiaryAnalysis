@@ -64,7 +64,7 @@
  *   ✅ SNV_ANNOTATE       - VEP 115 annotation
  *   ✅ PARSE_VEP_CSQ      - transcript 選取 + TSV 產生
  *   ✅ ACMG_CLASSIFY      - ACMG evidence 分類
- *   ✅ MITO_ANNOTATE      - mtDNA annotation（VEP + MITOMAP）
+ *   ✅ MITO_ANNOTATE      - mtDNA annotation（VEP + gnomAD-mito，CC0）
  *   ✅ STR_ANNOTATE       - STRchive threshold 分類
  *   ✅ CNV_SV_ANNOTATE   - AnnotSV（NCKUH WES/WGS + DRAGEN）
  *   🔲 ROH               - consanguinity + UPD

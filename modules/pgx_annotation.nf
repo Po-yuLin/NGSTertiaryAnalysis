@@ -183,7 +183,7 @@ process PGX_STELLARPGX {
     bcftools norm -m - all_var/${sample_id}_\${REGION_B2}.vcf.gz \
         | bcftools view -e 'GT="1/0"' \
         | bcftools view -e 'GT="0/0"' \
-        | bcftools view -e 'FILTER="PASS" & INFO/QD<10 || 0<ABHet<0.25' \
+        | bcftools view -e '(FILTER="PASS" && INFO/QD<10) || (INFO/ABHet>0 && INFO/ABHet<0.25)' \
         | bgzip -c > all_var/${sample_id}_all_norm.vcf.gz
     tabix all_var/${sample_id}_all_norm.vcf.gz
 

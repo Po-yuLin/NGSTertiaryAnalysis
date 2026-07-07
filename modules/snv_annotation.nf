@@ -93,10 +93,14 @@ process VEP_ANNOTATE {
 
     // LOFTEE bind mount 設定：
     //   loftee_data → 整個 loftee 資料目錄掛載至容器內 /opt/vep/Plugins/loftee_data
-    //   gerp bw     → 直接掛載至 /opt/vep/Plugins/（LOFTEE gerp_dist.pl 硬編碼路徑的 workaround）
+    //                 （含 human_ancestor.fa.gz、loftee.sql、gerp_...GRCh38.bw）
+    //   gerp bw     → 另外直接掛載至 /opt/vep/Plugins/（保留舊 gerp_dist.pl workaround）
+    //
+    // GERP 現在以 gerp_bigwig: 參數明確傳入 LoF plugin（指向 loftee_data 內的 bw），
+    // 不再只依賴檔名拼接的 workaround。若無此 bw，LoF 的 GERP-based flag 不會計算。
     //
     // 注意：apptainer_base_opts 提供 --bind /scratch,/data 基礎掛載
-    //       這裡在基礎上追加 loftee 相關的兩個 bind
+    //       這裡在基礎上追加 loftee 相關的 bind
     containerOptions "${params.apptainer_base_opts} \
         --bind ${params.loftee_dir}:/opt/vep/Plugins/loftee_data \
         --bind ${params.loftee_dir}/gerp_conservation_scores.homo_sapiens.GRCh38.bw:/opt/vep/Plugins/gerp_conservation_scores.homo_sapiens.GRCh38.bw"
@@ -158,7 +162,8 @@ PKNN_LLR \\
         --plugin LoF,\\
 loftee_path:/opt/vep/Plugins/,\\
 human_ancestor_fa:/opt/vep/Plugins/loftee_data/human_ancestor.fa.gz,\\
-conservation_file:/opt/vep/Plugins/loftee_data/loftee.sql \\
+conservation_file:/opt/vep/Plugins/loftee_data/loftee.sql,\\
+gerp_bigwig:/opt/vep/Plugins/loftee_data/gerp_conservation_scores.homo_sapiens.GRCh38.bw \\
         \\
         --plugin LoFtool,/opt/vep/Plugins/loftee_data/LoFtool_scores.txt \\
         \\
