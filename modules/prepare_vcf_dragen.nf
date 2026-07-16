@@ -91,12 +91,55 @@ process ADD_DRAGEN_TAG {
     """
 }
 
+// ──────────────────────────────────────────────────────────────
+// (選用) compound 合成：把相鄰/重疊的 cis 變異合成單一 canonical MNV
+//   DRAGEN 自帶 PS（phase set），直接拿它做 combine，不需 whatshap（不同於二級 NCKUH
+//   要先 whatshap）。這樣即使該版 DRAGEN 把 compound 拆開（如 SUZ12 delAAAinsTT），
+//   也能在進 VEP 前合回一筆，讓 HGVS p. 正確（p.Glu723_Thr724delinsAla）。
+//   combine_phased.py 與二級同一支（scripts/combine_phased.py，只用 Python 標準庫）；
+//   在 ADD_DRAGEN_TAG 的 norm -m -any「之前」做（此時仍是 DRAGEN 原始表示、帶 PS）。
+//   由 params.combine_phased 開關（預設 true）。chrM 多半無 PS，實質不受影響。
+// ──────────────────────────────────────────────────────────────
+process COMBINE_DRAGEN {
+
+    label 'process_low'
+
+    container "${params.sif_dir}/tertiary_python_1.0.0.sif"
+
+    input:
+    tuple val(sample_id), path(dragen_vcf)
+
+    output:
+    tuple val(sample_id), path("${sample_id}.dragen.combined.vcf.gz"), emit: vcf
+
+    script:
+    """
+    # combine_phased.py 只用 Python 標準庫，讀 (bgzip) VCF、自帶 faidx（讀 \${ref_fasta}.fai）。
+    python3 ${params.scripts_dir}/combine_phased.py \\
+        --in ${dragen_vcf} \\
+        --out ${sample_id}.dragen.combined.vcf \\
+        --fasta ${params.ref_fasta} \\
+        --max-gap ${params.combine_max_gap}
+    # 用 bcftools 排序 + 索引（-Oz 自帶 bgzip、index -t 免 tabix）；tertiary_python 已含 bcftools。
+    bcftools sort ${sample_id}.dragen.combined.vcf \\
+        -Oz -o ${sample_id}.dragen.combined.vcf.gz
+    bcftools index -t ${sample_id}.dragen.combined.vcf.gz
+    rm -f ${sample_id}.dragen.combined.vcf
+    """
+}
+
 workflow PREPARE_VCF_DRAGEN {
     take:
     dragen_ch   // tuple val(sample_id), path(dragen_vcf)（不需要 tbi）
 
     main:
-    ADD_DRAGEN_TAG(dragen_ch)
+    // 先 combine（用 DRAGEN 原生 PS）再進 norm/tag；--combine_phased false 可關閉。
+    if (params.combine_phased) {
+        COMBINE_DRAGEN(dragen_ch)
+        ADD_DRAGEN_TAG(COMBINE_DRAGEN.out.vcf)
+    } else {
+        ADD_DRAGEN_TAG(dragen_ch)
+    }
 
     emit:
     snv_ch  = ADD_DRAGEN_TAG.out.snv_ch
