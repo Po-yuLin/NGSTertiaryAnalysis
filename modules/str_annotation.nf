@@ -166,3 +166,37 @@ process STR_PARSE_DRAGEN {
         ${sample_id}.str.tsv | wc -l >&2
     """
 }
+
+// ──────────────────────────────────────────────────────────────
+// ANNOTATE_STR_NCKUH sub-workflow：NCKUH GangSTR STR annotation 車道。
+//   GangSTR 輸出的 .str.vcf 是未壓縮 → 先 bgzip+tabix（STR_PREPARE_NCKUH），再 STRchive
+//   threshold 分類（STR_PARSE_NCKUH）。DRAGEN STR 為單一 process（STR_PARSE_DRAGEN），
+//   直接裸呼叫、不納入本 sub-workflow。
+// ──────────────────────────────────────────────────────────────
+workflow ANNOTATE_STR_NCKUH {
+    take:
+    str_ch          // tuple(sample_id, str_vcf) —— 未壓縮 GangSTR VCF
+
+    main:
+    STR_PREPARE_NCKUH(str_ch)
+    STR_PARSE_NCKUH(STR_PREPARE_NCKUH.out.str_prepared_ch)
+
+    emit:
+    str_tsv = STR_PARSE_NCKUH.out.str_tsv_ch
+}
+
+// ──────────────────────────────────────────────────────────────
+// ANNOTATE_STR_DRAGEN sub-workflow：DRAGEN STR annotation 車道。
+//   DRAGEN 的 .repeats.vcf.gz 已壓縮，不需 prepare，直接 STRchive 分類（STR_PARSE_DRAGEN）。
+//   只有一個 process，但包成 sub-workflow 與 ANNOTATE_STR_NCKUH 對稱、主流程更一致。
+// ──────────────────────────────────────────────────────────────
+workflow ANNOTATE_STR_DRAGEN {
+    take:
+    str_ch          // tuple(sample_id, str_vcf_gz) —— DRAGEN 已壓縮 repeats VCF
+
+    main:
+    STR_PARSE_DRAGEN(str_ch)
+
+    emit:
+    str_tsv = STR_PARSE_DRAGEN.out.str_tsv_ch
+}

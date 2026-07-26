@@ -547,6 +547,7 @@ OUTPUT_COLUMNS = [
     # Caller 資訊
     "CALLERS", "DP_DV", "AD_DV", "VAF_DV", "DP_HC", "AD_HC",
     "ZYGOSITY", "GT_DV", "GT_HC",
+    "STRAND_BIAS",                  # ★ strand-bias 警示（FS/SOR；DV-only 無資料 → "."）
     # 族群頻率
     "GNOMAD_G_AF", "GNOMAD_G_EAS_AF",
     "GNOMAD_E_AF", "GNOMAD_E_EAS_AF",
@@ -581,6 +582,42 @@ OUTPUT_COLUMNS = [
 ]
  
  
+# ──────────────────────────────────────────────────────────────
+# strand bias 警示（germline 只標記、不硬刪）
+# ──────────────────────────────────────────────────────────────
+def strand_bias_flag(info_dict: dict, ref: str, alt: str) -> str:
+    """
+    依 INFO/FS（FisherStrand，Phred-scaled p-value）與 INFO/SOR（Symmetric Odds Ratio）
+    判 strand bias，輸出臨床審閱用的警示字串。germline 只「標記」不硬刪：
+      - 無 FS 也無 SOR（如 NCKUH DeepVariant-only 位點）→ "."（沒資料，需人工看）
+      - 超過門檻                                        → "WARN(FS=..,SOR=..)"
+      - 否則                                            → "PASS"
+    門檻採 GATK 慣例：SNV `FS>60 / SOR>3.0`；indel `FS>200 / SOR>10.0`。
+    註：低深度檢定力不足、target/amplicon 端也可能單股偏，故只作警示、不當過濾。
+    DRAGEN 與 NCKUH-HC 位點都有 FS/SOR；DV-only 位點無 → "."（人工複核）。
+    """
+    def _f(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+    fs  = _f(info_dict.get("FS"))
+    sor = _f(info_dict.get("SOR"))
+    if fs is None and sor is None:
+        return "."          # 無 FS 也無 SOR（或無法解析）→ 沒資料，需人工複核
+    is_indel = len(ref) != 1 or len(alt) != 1
+    fs_cut, sor_cut = (200.0, 10.0) if is_indel else (60.0, 3.0)
+    biased = (fs is not None and fs > fs_cut) or (sor is not None and sor > sor_cut)
+    if biased:
+        parts = []
+        if fs is not None:
+            parts.append("FS=%.1f" % fs)
+        if sor is not None:
+            parts.append("SOR=%.2f" % sor)
+        return "WARN(%s)" % ",".join(parts)
+    return "PASS"
+
+
 # ──────────────────────────────────────────────────────────────
 # 主解析流程
 # ──────────────────────────────────────────────────────────────
@@ -664,6 +701,7 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
             gt_dv    = parse_gt_field(fmt, smp_dv, "GT")
             gt_hc    = parse_gt_field(fmt, smp_hc, "GT")
             zygosity = infer_zygosity(gt_dv, gt_hc, chrom)
+            strand_bias = strand_bias_flag(info_dict, ref, alt)
  
             # CSQ 解析
             csq_raw = info_dict.get("CSQ", "")
@@ -782,6 +820,7 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
                     "ZYGOSITY":             zygosity,
                     "GT_DV":                gt_dv,
                     "GT_HC":                gt_hc,
+                    "STRAND_BIAS":          strand_bias,
                     "GNOMAD_G_AF":          gnomad_g_af,
                     "GNOMAD_G_EAS_AF":      gnomad_g_eas_af,
                     "GNOMAD_E_AF":          gnomad_e_af,

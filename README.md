@@ -23,6 +23,12 @@ Two input modes are supported:
 
 ## Pipeline Flowchart
 
+`main_tertiary.nf` builds per-input-type channels from the samplesheet, then composes one
+sub-workflow per stage (`modules/*.nf`): `PREPARE_VCF` / `PREPARE_VCF_DRAGEN` → `ANNOTATE_SNV`
+(VEP → CSQ parse → ACMG) · `ANNOTATE_CNV_SV_{NCKUH,DRAGEN}` · `ANNOTATE_STR_{NCKUH,DRAGEN}`, plus
+the `PGX_ANNOTATE` sub-workflow and bare `MITO_ANNOTATE`. DRAGEN additionally runs
+`PLOIDY_REPORT_DRAGEN` (sex/ploidy QC from its native ploidy.vcf).
+
 ```
 VCF (nckuh / dragen)                    BAM (WGS only, optional)
         │                                         │
@@ -44,11 +50,11 @@ VCF (nckuh / dragen)                    BAM (WGS only, optional)
 │       ↓                         │     │  STR:  GangSTR/ExpansionHunter   │
 │  Pangolin (splice, GPU)         │     │        + STRchive → str.tsv      │
 │       ↓                         │     │                                  │
-│  PARSE_CSQ (60 columns)         │     │  CNV/SV: AnnotSV 3.5.10          │
-│       ↓                         │     │   NCKUH WES  → cnv.annotated.tsv │
-│  ACMG classifier                │     │   NCKUH WGS  → sv.annotated.tsv  │
-│  (ClinGen SVI 2022)             │     │   DRAGEN CNV → cnv.annotated.tsv │
-│       ↓                         │     │   DRAGEN SV  → sv.annotated.tsv  │
+│  PARSE_CSQ (61 columns)         │     │  CNV/SV: AnnotSV 3.5.10          │
+│       ↓                         │     │   CNV → cnv.annotated.tsv        │
+│  ACMG classifier                │     │     gCNV[WES]/CNVkit[WGS]/DRAGEN │
+│  (ClinGen SVI 2022)             │     │   SV  → sv.annotated.tsv         │
+│       ↓                         │     │     Delly[NCKUH] / DRAGEN sv.vcf │
 │  snv_indel.acmg.tsv (65 cols)   │     └──────────────────────────────────┘
 └─────────────────────────────────┘
 
@@ -554,32 +560,104 @@ nextflow -c nextflow_tertiary.config run main_tertiary.nf \
 
 ```
 {out_dir}/{SAMPLE_ID}/
-├── 00_prepare/          Preprocessed VCF (intermediate)
-├── 01_vep/              VEP annotation output (intermediate)
-├── 02_pangolin/         Pangolin splice scores (intermediate)
+├── 00_prepare/          {SAMPLE_ID}.snv_for_annotation.vcf.gz  (intermediate)
+│                        DRAGEN only: {SAMPLE_ID}.mito_for_annotation.vcf.gz (chrM split out)
+│                        DRAGEN only: {SAMPLE_ID}.ploidy_qc.txt  ← sex/ploidy QC (see below)
+├── 01_vep/              {SAMPLE_ID}.vep.vcf.gz       VEP 115 annotated (intermediate)
+├── 02_pangolin/         {SAMPLE_ID}.pangolin.vcf.gz  Pangolin splice (intermediate)
 ├── 03_acmg/
 │   └── {SAMPLE_ID}.snv_indel.acmg.tsv     ★ SNV/Indel (65 columns)
 ├── 04_mito/
-│   └── {SAMPLE_ID}.mito.tsv               ★ mtDNA variants (21 columns)
+│   ├── {SAMPLE_ID}.mito.tsv               ★ mtDNA variants (21 columns)
+│   └── {SAMPLE_ID}.mito.vep.vcf.gz         VEP-annotated mito VCF
 ├── 05_str/
 │   └── {SAMPLE_ID}.str.tsv                ★ STR (22 columns)
 ├── 06_cnv_sv/
-│   ├── {SAMPLE_ID}.cnv.annotated.tsv      ★ CNV (AnnotSV)
-│   └── {SAMPLE_ID}.sv.annotated.tsv       ★ SV (AnnotSV)
+│   ├── {SAMPLE_ID}.cnv.annotated.tsv      ★ CNV (AnnotSV; 121 col, 113 for NCKUH-WGS)
+│   ├── {SAMPLE_ID}.cnv.unannotated.tsv     CNV rows AnnotSV could not annotate
+│   ├── {SAMPLE_ID}.sv.annotated.tsv       ★ SV (AnnotSV; 121 col)
+│   └── {SAMPLE_ID}.sv.unannotated.tsv      SV rows AnnotSV could not annotate
 ├── 07_pgx/
 │   ├── {SAMPLE_ID}.pgx.tsv                ★ PGx report (16 columns, CPIC Level A)
 │   ├── {SAMPLE_ID}.pharmcat.report.json   PharmCAT full report (archive)
-│   ├── {SAMPLE_ID}.outside_calls.tsv      Outside calls (archive)
+│   ├── {SAMPLE_ID}.outside_calls.tsv      PharmCAT outside-calls input (archive)
 │   ├── {SAMPLE_ID}.stellarpgx.tsv         CYP2D6 diplotype (WGS only)
-│   └── {SAMPLE_ID}.optitype.tsv           HLA-A/B alleles (WGS only)
+│   └── {SAMPLE_ID}.optitype.tsv           HLA-A/B/C alleles (WGS only)
 └── pipeline_info/       Execution reports (HTML + trace)
 ```
 
-### pgx.tsv columns (16)
+> **Same output schema, different upstream source.** NCKUH SNV = DeepVariant + HaplotypeCaller
+> ensemble (two callers → `*_DV` / `*_HC` columns); DRAGEN SNV = a single DRAGEN VCF (data lands in
+> the `*_DV` columns, `*_HC` empty). CNV source: gCNV **[NCKUH WES]** / CNVkit **[NCKUH WGS]** /
+> DRAGEN cnv.vcf; SV source: Delly **[NCKUH]** / DRAGEN sv.vcf. `00_prepare/*.ploidy_qc.txt` is
+> **DRAGEN-only** (built from DRAGEN's native ploidy.vcf, unified with secondary's mosdepth ploidy
+> QC); for NCKUH the equivalent lives in secondary `03_alignment_qc/`.
 
-`SAMPLE_ID · PIPELINE · GENE · DIPLOTYPE · ACTIVITY_SCORE · PHENOTYPE · DRUG · GUIDELINE_SOURCE · RECOMMENDATION · IMPLICATION · CPIC_LEVEL · DPWG_LEVEL · OUTSIDE_CALLER · MTRN1_RISK · NOTES · EVIDENCE_STRENGTH`
+### 03_acmg — `{SAMPLE_ID}.snv_indel.acmg.tsv` (65 columns)
 
-Covers CPIC Level A genes: CYP2D6, CYP2C19, CYP2C9, DPYD, TPMT, NUDT15, SLCO1B1, HLA-A, HLA-B, UGT1A1, G6PD, MT-RNR1 (via mito pipeline), IFNL3, CACNA1S, RYR1.
+The primary SNV/indel table (`parse_vep_csq.py` 61 columns + 4 ACMG columns):
+
+| Group | Columns |
+|-------|---------|
+| Locus | `CHROM POS REF ALT RS_ID` |
+| Transcript | `GENE TRANSCRIPT TRANSCRIPT_TYPE HGVS_C HGVS_P CONSEQUENCE IMPACT EXON INTRON` |
+| Caller / genotype | `CALLERS DP_DV AD_DV VAF_DV DP_HC AD_HC ZYGOSITY GT_DV GT_HC` |
+| Strand bias | `STRAND_BIAS` |
+| Population AF | `GNOMAD_G_AF GNOMAD_G_EAS_AF GNOMAD_E_AF GNOMAD_E_EAS_AF GNOMAD_E_AF_DBNSFP GNOMAD_E_EAS_AF_DBNSFP TG_EAS_AF` |
+| ClinVar / OMIM | `CLINVAR_SIG CLINVAR_STARS CLINVAR_DN CLINVAR_SIGCONF CLINVAR_VARIATION_ID OMIM_IDS` |
+| Loss-of-function | `LOFTEE LOFTEE_FILTER LOFTEE_FLAGS LOFTOOL` |
+| In-silico | `BAYESDEL_NOAF(_PRED) ALPHAMISSENSE(_PRED) ESM1B(_PRED) VARITY_R SIFT(_PRED) DANN PHACTBOOST PHYLOP100 GERP PKNN_LLR PKNN_EVIDENCE` |
+| Splice | `PANGOLIN_SCORE PANGOLIN_DETAIL` |
+| Protein / gene | `DOMAINS SWISSPROT HGNC_ID` |
+| ACMG | `ACMG_CRITERIA ACMG_SCORE ACMG_CLASS ACMG_NOTES` |
+
+- **`CALLERS`**: NCKUH = `DV` / `HC` / `DV+HC`; DRAGEN = `DRAGEN`.
+- **`STRAND_BIAS`**: `PASS` / `WARN(FS=..,SOR=..)` from FisherStrand + StrandOddsRatio (GATK
+  thresholds SNV FS>60/SOR>3.0, indel FS>200/SOR>10.0); **`.`** when no FS/SOR is available
+  (DeepVariant-only records) → flag for manual review.
+- **`ACMG_CLASS`**: `Pathogenic` / `Likely_pathogenic` / `VUS` / `Likely_benign` / `Benign`, with
+  the triggered rules in `ACMG_CRITERIA` and the point total in `ACMG_SCORE`.
+
+### 04_mito — `{SAMPLE_ID}.mito.tsv` (21 columns)
+
+`CHROM POS REF ALT · GENE HGVS_C HGVS_P CONSEQUENCE IMPACT BIOTYPE · GENOTYPE DP AF_SAMPLE ·
+GNOMAD_MITO_AF_HOM GNOMAD_MITO_AF_HET GNOMAD_MITO_AN · CLINVAR_SIG CLINVAR_DN CLINVAR_VARIATION_ID
+OMIM_IDS · PIPELINE`. **`AF_SAMPLE`** = mitochondrial heteroplasmy fraction; gnomAD-mito
+frequencies are split into homoplasmy (`_HOM`) and heteroplasmy (`_HET`).
+
+### 05_str — `{SAMPLE_ID}.str.tsv` (22 columns)
+
+Only loci with a STRchive record (known pathogenic STRs) are emitted. `CHROM POS END STR_ID GENE
+MOTIF LOCUS_STRUCTURE TYPE · REPCN_A1 REPCN_A2 DP REPCI · BENIGN_MIN BENIGN_MAX PATHOGENIC_MIN
+PATHOGENIC_MAX INTERMEDIATE_MIN INTERMEDIATE_MAX · CLASSIFICATION DISEASE INHERITANCE PIPELINE`.
+**`REPCN_A1/A2`** = repeat copy number per allele; **`CLASSIFICATION`** = `normal` /
+`intermediate` / `pathogenic` (from the STRchive thresholds in the `*_MIN/MAX` columns).
+
+### 06_cnv_sv — AnnotSV TSV (standard AnnotSV 3.5.10 schema)
+
+`cnv.annotated.tsv` and `sv.annotated.tsv` follow AnnotSV's standard output (**121 columns**; the
+NCKUH-WGS CNV path is **113** because CNVkit is fed as BED, without the 8 VCF columns
+`ID/REF/ALT/QUAL/FILTER/INFO/FORMAT/<sample>`). Key columns: `AnnotSV_ID SV_chrom SV_start SV_end
+SV_length SV_type Gene_name Annotation_mode` plus AnnotSV's pathogenicity/overlap annotations
+(`P_gain_*` / `P_loss_*`, ClinVar/ClinGen, OMIM, `ACMG_class`). Full column reference:
+[AnnotSV output docs](https://github.com/lgmgeo/AnnotSV). `*.unannotated.tsv` holds records AnnotSV
+could not annotate.
+
+### 07_pgx
+
+- **`{SAMPLE_ID}.pgx.tsv`** (16 columns) — consolidated PGx recommendations:
+  `SAMPLE_ID PIPELINE GENE DIPLOTYPE ACTIVITY_SCORE PHENOTYPE DRUG GUIDELINE_SOURCE RECOMMENDATION
+  IMPLICATION CPIC_LEVEL DPWG_LEVEL OUTSIDE_CALLER MTRN1_RISK NOTES EVIDENCE_STRENGTH`. Covers CPIC
+  Level A genes: CYP2D6, CYP2C19, CYP2C9, DPYD, TPMT, NUDT15, SLCO1B1, HLA-A, HLA-B, UGT1A1, G6PD,
+  MT-RNR1 (via mito pipeline), IFNL3, CACNA1S, RYR1.
+  - *(DRAGEN only)* `NOTES` additionally carries a cross-check against DRAGEN's native PGx calls
+    (`other/{sample}/germline_seq/{sample}.targeted.json`): per gene, `DRAGEN 一致/不一致/未比對: <DRAGEN
+    genotype>` (concordant / differs-same-notation / different-notation-not-judged). Reference notations
+    (`*1`, `Reference`, `B(wildtype)`) are normalized; DRAGEN's ambiguous `;`-separated diplotypes match
+    if ours is among the candidates; genes DRAGEN doesn't call (e.g. HLA) are left untouched. Columns unchanged.
+- **`{SAMPLE_ID}.stellarpgx.tsv`** (WGS only) — `GENE DIPLOTYPE ACTIVITY_SCORE PHENOTYPE SOURCE` (CYP2D6).
+- **`{SAMPLE_ID}.optitype.tsv`** (WGS only) — `GENE ALLELE_1 ALLELE_2 SOURCE` (HLA typing).
+- **`{SAMPLE_ID}.outside_calls.tsv`** — PharmCAT outside-calls input; **`.pharmcat.report.json`** — PharmCAT's full report.
 
 ---
 
@@ -613,6 +691,18 @@ Expected results after running secondary → tertiary pipeline:
 
 
 > ⚠️ NA12878 HLA-B ground truth is `*07:02/*40:02`（heterozygous），the current pipeline call  `*08:01/*08:01`, which is close but still incorrect.
+
+### 2026-07 refactor validation (NA12878 WES/WGS + VAL-10 DRAGEN)
+
+After the sub-workflow refactor, all three inputs produced the full 8-stage output with an identical
+65-column `03_acmg` schema (`03_acmg` rows: WES 45,919 · WGS 6,930,335 · DRAGEN 5,940,563). Confirmed:
+
+- **DRAGEN AD preserved** (VAL-10): `AD_DV` populated on 5,940,465 / 5,940,563 records — the earlier
+  DRAGEN combined-record "AD dropped" bug is fixed.
+- **DRAGEN ploidy QC**: `00_prepare/VAL-10.ploidy_qc.txt` → estimated `XX`, `sex_check: OK`.
+- **STRAND_BIAS**: `PASS` / `WARN(...)` where FS/SOR exist; `.` on DeepVariant-only records (manual review).
+- **PGx WES vs WGS gating**: WES emits PharmCAT only; WGS + DRAGEN additionally emit OptiType (HLA-A/B/C)
+  and StellarPGx (CYP2D6).
 
 ---
 

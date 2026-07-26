@@ -728,6 +728,7 @@ workflow PGX_ANNOTATE {
     pgx_wes_vcf_ch  // WES 有 BAM：tuple(sid, ptype, vcf, tbi, bam, bai)
                     // WES 無 BAM：tuple(sid, ptype, vcf, tbi)
     mito_tsv_ch     // tuple(sample_id, mito_tsv)                                    ← 全樣本
+    dragen_targeted_ch  // tuple(sid, targeted.json)：DRAGEN 原生 PGx 判讀；非 DRAGEN 傳 Channel.empty()
 
     main:
 
@@ -822,6 +823,54 @@ workflow PGX_ANNOTATE {
 
     PGX_PARSE(parse_input_ch)
 
+    // ── DRAGEN：交叉註記 DRAGEN 原生 PGx 判讀進 NOTES（只有 targeted.json 存在的樣本會 join 進來；
+    //    非 DRAGEN 的 dragen_targeted_ch 為空 → 0 task）。concordance 版取代 base 版 pgx.tsv。
+    ch_cmp_py = file("${params.scripts_dir}/compare_dragen_pgx.py")
+    PGX_DRAGEN_CONCORDANCE(
+        PGX_PARSE.out.pgx_tsv_ch.join(dragen_targeted_ch),
+        ch_cmp_py
+    )
+    // 最終 pgx.tsv：有做 concordance 的樣本用 concordance 版，其餘用 base 版
+    ch_pgx_final = PGX_PARSE.out.pgx_tsv_ch
+        .join(PGX_DRAGEN_CONCORDANCE.out.pgx_tsv_ch, remainder: true)
+        .map { vals -> tuple(vals[0], (vals.size() > 2 && vals[2]) ? vals[2] : vals[1]) }
+
     emit:
-    pgx_tsv_ch = PGX_PARSE.out.pgx_tsv_ch
+    pgx_tsv_ch = ch_pgx_final
+}
+
+// ──────────────────────────────────────────────────────────────
+// PGX_DRAGEN_CONCORDANCE（僅 DRAGEN）：把 DRAGEN 原生 targeted.json 的 PGx 判讀交叉註記進
+//   pgx.tsv 的 NOTES 欄（欄位不變）。同 → "DRAGEN 一致: <raw>"、異 → "不一致"、命名系統
+//   不同 → "未比對"，且一律附上 DRAGEN 原始 genotype 供人工查閱。找不到 targeted.json 的
+//   樣本不會進來（main 已 filter + warn）。本 process 依賴 PGX_PARSE 輸出（嚴格下游），
+//   發布的 pgx.tsv 取代基礎版本。
+// ──────────────────────────────────────────────────────────────
+process PGX_DRAGEN_CONCORDANCE {
+
+    label 'process_low'
+
+    container "${params.sif_dir}/tertiary_python_1.0.0.sif"
+
+    containerOptions "${params.apptainer_base_opts}"
+
+    publishDir "${params.out_dir}/${sample_id}/07_pgx", mode: 'copy'
+
+    input:
+    // pgx_in 以別名 staged，避免與輸出的 ${sample_id}.pgx.tsv 撞名
+    tuple val(sample_id), path(pgx_in, stageAs: "input.pgx.tsv"), path(targeted_json)
+    path cmp_py
+
+    output:
+    tuple val(sample_id), path("${sample_id}.pgx.tsv"), emit: pgx_tsv_ch
+
+    script:
+    """
+    echo "[PGX_DRAGEN_CONCORDANCE] ${sample_id}：DRAGEN targeted.json → pgx.tsv NOTES 交叉註記" >&2
+    python3 ${cmp_py} \\
+        --pgx         input.pgx.tsv \\
+        --dragen-json ${targeted_json} \\
+        --sample      ${sample_id} \\
+        --output      ${sample_id}.pgx.tsv
+    """
 }

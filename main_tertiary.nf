@@ -80,22 +80,13 @@ nextflow.enable.dsl = 2
 // ──────────────────────────────────────────────────────────────
 
 include { PREPARE_VCF        } from './modules/prepare_vcf.nf'
-include { PREPARE_VCF_DRAGEN } from './modules/prepare_vcf_dragen.nf'
-include { SNV_ANNOTATE       } from './modules/snv_annotation.nf'
-include { PARSE_VEP_CSQ      } from './modules/parse_csq.nf'
-include { ACMG_CLASSIFY      } from './modules/acmg_classifier.nf'
+include { PREPARE_VCF_DRAGEN; PLOIDY_REPORT_DRAGEN } from './modules/prepare_vcf_dragen.nf'
+include { ANNOTATE_SNV       } from './modules/annotate_snv.nf'
 include { MITO_ANNOTATE      } from './modules/mito_annotation.nf'
-include { STR_PREPARE_NCKUH  } from './modules/str_annotation.nf'
-include { STR_PARSE_NCKUH    } from './modules/str_annotation.nf'
-include { STR_PARSE_DRAGEN   } from './modules/str_annotation.nf'
-include { CNVKIT_TO_BED          } from './modules/cnv_sv_annotation.nf'
-include { ANNOTSV_CNV_NCKUH_WES  } from './modules/cnv_sv_annotation.nf'
-include { ANNOTSV_CNV_NCKUH_WGS  } from './modules/cnv_sv_annotation.nf'
-include { ANNOTSV_SV_NCKUH       } from './modules/cnv_sv_annotation.nf'
-include { PREPARE_CNV_DRAGEN     } from './modules/cnv_sv_annotation.nf'
-include { PREPARE_SV_DRAGEN      } from './modules/cnv_sv_annotation.nf'
-include { ANNOTSV_CNV_DRAGEN     } from './modules/cnv_sv_annotation.nf'
-include { ANNOTSV_SV_DRAGEN      } from './modules/cnv_sv_annotation.nf'
+include { ANNOTATE_STR_NCKUH  } from './modules/str_annotation.nf'
+include { ANNOTATE_STR_DRAGEN } from './modules/str_annotation.nf'
+include { ANNOTATE_CNV_SV_NCKUH  } from './modules/cnv_sv_annotation.nf'
+include { ANNOTATE_CNV_SV_DRAGEN } from './modules/cnv_sv_annotation.nf'
 include { PGX_ANNOTATE           } from './modules/pgx_annotation.nf'
 
 // ──────────────────────────────────────────────────────────────
@@ -335,47 +326,37 @@ workflow {
         }
         .filter { it != null }
 
-        STR_PREPARE_NCKUH(nckuh_str_ch)
-        STR_PARSE_NCKUH(STR_PREPARE_NCKUH.out.str_prepared_ch)
+        ANNOTATE_STR_NCKUH(nckuh_str_ch)
 
-        // ── NCKUH CNV：依 seq_type 分流 WES / WGS ────────────────
-        def seq_types = samples.collect { it.seq_type }.unique()
-
-        if (seq_types.contains("WES")) {
-            nckuh_cnv_wes_ch = Channel.fromList(samples)
-                .filter { s -> s.seq_type == "WES" }
-                .map { s ->
-                    def vcf = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.gcnv.vcf.gz")
-                    def tbi = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.gcnv.vcf.gz.tbi")
-                    if (!vcf.exists()) {
-                        log.warn "[WARN] 找不到 gCNV VCF，跳過：${vcf}"
-                        return null
-                    }
-                    tuple(s.sample_id, vcf, tbi)
+        // ── NCKUH CNV/SV annotation（sub-workflow）────────────────
+        //   CNV 依 seq_type 分流：WES→gCNV VCF、WGS→CNVkit .call.cns（先轉 BED）；
+        //   SV→Delly（WES+WGS 共用）。無對應樣本時該 channel 為空 → 對應 process 0 task，
+        //   不需再用 if (seq_types.contains(...)) 包起來。
+        nckuh_cnv_wes_ch = Channel.fromList(samples)
+            .filter { s -> s.seq_type == "WES" }
+            .map { s ->
+                def vcf = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.gcnv.vcf.gz")
+                def tbi = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.gcnv.vcf.gz.tbi")
+                if (!vcf.exists()) {
+                    log.warn "[WARN] 找不到 gCNV VCF，跳過：${vcf}"
+                    return null
                 }
-                .filter { it != null }
+                tuple(s.sample_id, vcf, tbi)
+            }
+            .filter { it != null }
 
-            ANNOTSV_CNV_NCKUH_WES(nckuh_cnv_wes_ch)
-        }
-
-        if (seq_types.contains("WGS")) {
-            nckuh_cnvkit_ch = Channel.fromList(samples)
-                .filter { s -> s.seq_type == "WGS" }
-                .map { s ->
-                    def cns = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.call.cns")
-                    if (!cns.exists()) {
-                        log.warn "[WARN] 找不到 CNVkit .call.cns，跳過：${cns}"
-                        return null
-                    }
-                    tuple(s.sample_id, cns)
+        nckuh_cnvkit_ch = Channel.fromList(samples)
+            .filter { s -> s.seq_type == "WGS" }
+            .map { s ->
+                def cns = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.call.cns")
+                if (!cns.exists()) {
+                    log.warn "[WARN] 找不到 CNVkit .call.cns，跳過：${cns}"
+                    return null
                 }
-                .filter { it != null }
+                tuple(s.sample_id, cns)
+            }
+            .filter { it != null }
 
-            CNVKIT_TO_BED(nckuh_cnvkit_ch)
-            ANNOTSV_CNV_NCKUH_WGS(CNVKIT_TO_BED.out.cnvkit_bed_ch)
-        }
-
-        // ── NCKUH SV（Delly，WES + WGS 共用）────────────────────
         nckuh_sv_ch = Channel.fromList(samples).map { s ->
             def vcf = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.delly.vcf.gz")
             def tbi = file("${s.input_dir}/05_cnv_sv/${s.sample_id}.delly.vcf.gz.tbi")
@@ -387,7 +368,7 @@ workflow {
         }
         .filter { it != null }
 
-        ANNOTSV_SV_NCKUH(nckuh_sv_ch)
+        ANNOTATE_CNV_SV_NCKUH(nckuh_cnv_wes_ch, nckuh_cnvkit_ch, nckuh_sv_ch)
 
         // ── NCKUH BAM channel（PGx 全樣本，含 WES + WGS）────────
         // WGS：StellarPGx + OptiType + GATK gVCF
@@ -419,6 +400,21 @@ workflow {
         PREPARE_VCF_DRAGEN(input_ch)
         snv_ch = PREPARE_VCF_DRAGEN.out.snv_ch
 
+        // ── DRAGEN ploidy QC（性別 + aneuploidy，來自 DRAGEN 原生 ploidy.vcf）──
+        //   與二級 PLOIDY_CHECK 同一套 qc.txt 呈現；ploidy.vcf 不存在則 warn 後跳過。
+        ch_dragen_ploidy_py = file("${params.scripts_dir}/parse_dragen_ploidy.py")
+        dragen_ploidy_ch = Channel.fromList(samples).map { s ->
+            def pvcf = file("${s.input_dir}/vcf.gz/${s.sample_id}.ploidy.vcf.gz")
+            if (!pvcf.exists()) {
+                log.warn "[WARN] 找不到 DRAGEN ploidy VCF，跳過 ploidy QC：${pvcf}"
+                return null
+            }
+            tuple(s.sample_id, pvcf)
+        }
+        .filter { it != null }
+
+        PLOIDY_REPORT_DRAGEN(dragen_ploidy_ch, ch_dragen_ploidy_py)
+
         dragen_mito_ch = PREPARE_VCF_DRAGEN.out.mito_ch.map { sample_id, mito_vcf, mito_tbi ->
             tuple(sample_id, "dragen", mito_vcf, mito_tbi)
         }
@@ -435,9 +431,10 @@ workflow {
         }
         .filter { it != null }
 
-        STR_PARSE_DRAGEN(dragen_str_ch)
+        ANNOTATE_STR_DRAGEN(dragen_str_ch)
 
-        // ── DRAGEN CNV ────────────────────────────────────────
+        // ── DRAGEN CNV/SV annotation（sub-workflow）────────────────
+        //   CNV：PASS + 去 copy-neutral → AnnotSV；SV：PASS + INS symbolic → AnnotSV。
         dragen_cnv_ch = Channel.fromList(samples).map { s ->
             def vcf = file("${s.input_dir}/vcf.gz/${s.sample_id}.cnv.vcf.gz")
             if (!vcf.exists()) {
@@ -448,10 +445,6 @@ workflow {
         }
         .filter { it != null }
 
-        PREPARE_CNV_DRAGEN(dragen_cnv_ch)
-        ANNOTSV_CNV_DRAGEN(PREPARE_CNV_DRAGEN.out.cnv_filtered_ch)
-
-        // ── DRAGEN SV ─────────────────────────────────────────
         dragen_sv_ch = Channel.fromList(samples).map { s ->
             def vcf = file("${s.input_dir}/vcf.gz/${s.sample_id}.sv.vcf.gz")
             if (!vcf.exists()) {
@@ -462,8 +455,7 @@ workflow {
         }
         .filter { it != null }
 
-        PREPARE_SV_DRAGEN(dragen_sv_ch)
-        ANNOTSV_SV_DRAGEN(PREPARE_SV_DRAGEN.out.sv_filtered_ch)
+        ANNOTATE_CNV_SV_DRAGEN(dragen_cnv_ch, dragen_sv_ch)
 
         // ── DRAGEN BAM channel（PGx 全樣本，含 WES + WGS）────────
         // DRAGEN 輸出 BAM 路徑依版本可能不同，嘗試兩個慣用路徑
@@ -484,15 +476,7 @@ workflow {
         .filter { it != null }
     }
 
-    // ── 以下完全共用（兩種 pipeline 相同）────────────────────
-
-    SNV_ANNOTATE(snv_ch)
-
-    PARSE_VEP_CSQ(
-        SNV_ANNOTATE.out.vep_ch,
-        SNV_ANNOTATE.out.pangolin_ch
-    )
-
+    // ── SNV annotation 尾段（sub-workflow：VEP → CSQ parse → ACMG，兩 pipeline 共用）──
     def clingen_hi_file = (params.clingen_hi_tsv && file(params.clingen_hi_tsv).exists())
         ? file(params.clingen_hi_tsv)
         : file("NO_FILE")
@@ -501,11 +485,7 @@ workflow {
         ? file(params.gene_moi_tsv)
         : file("NO_FILE")
 
-    ACMG_CLASSIFY(
-        PARSE_VEP_CSQ.out.full_tsv_ch,
-        clingen_hi_file,
-        gene_moi_file
-    )
+    ANNOTATE_SNV(snv_ch, clingen_hi_file, gene_moi_file)
 
     // ── PGx annotation（PharmCAT + StellarPGx）────────────────
     // --run_pgx false（預設）→ 跳過
@@ -546,10 +526,25 @@ workflow {
                 tuple(sid, ptype, vcf, tbi)
             }
 
+        // DRAGEN 原生 PGx 判讀（targeted.json）channel；非 DRAGEN 為空。交叉註記在 PGX_ANNOTATE 內做。
+        //   路徑：{input_dir}/other/{sample_id}/germline_seq/{sample_id}.targeted.json
+        //   找不到就 warn 後跳過（該樣本保留基礎版 pgx.tsv，不報錯）。欄位不變。
+        dragen_targeted_ch = (pipeline_type == 'dragen')
+            ? Channel.fromList(samples).map { s ->
+                  def tj = file("${s.input_dir}/other/${s.sample_id}/germline_seq/${s.sample_id}.targeted.json")
+                  if (!tj.exists()) {
+                      log.warn "[WARN] 找不到 DRAGEN targeted.json，跳過 PGx 交叉註記：${tj}"
+                      return null
+                  }
+                  tuple(s.sample_id, tj)
+              }.filter { it != null }
+            : Channel.empty()
+
         PGX_ANNOTATE(
             pgx_wgs_ch,
             pgx_wes_bam_ch.mix(pgx_wes_ch),
-            MITO_ANNOTATE.out.mito_tsv_ch.ifEmpty(Channel.empty())
+            MITO_ANNOTATE.out.mito_tsv_ch.ifEmpty(Channel.empty()),
+            dragen_targeted_ch
         )
     }
 }

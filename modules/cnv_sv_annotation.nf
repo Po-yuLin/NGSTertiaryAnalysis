@@ -481,3 +481,52 @@ process ANNOTSV_SV_DRAGEN {
     wc -l ${sample_id}.sv.annotated.tsv >&2
     """
 }
+
+// ──────────────────────────────────────────────────────────────
+// ANNOTATE_CNV_SV_NCKUH sub-workflow：NCKUH 的 CNV + SV annotation 車道。
+//   CNV 依 seq_type 分流（WES=gCNV VCF、WGS=CNVkit .call.cns 先轉 BED）；SV=Delly（共用）。
+//   三個輸入 channel 由 main 依 sample sheet 建好傳入；WES/WGS 無對應樣本時傳空 channel，
+//   對應 process 自動 0 task（不需 if 條件包起來）。所有 process 自帶 publishDir → 無強制 emit，
+//   仍 emit TSV 供未來下游（報告彙整）使用。
+// ──────────────────────────────────────────────────────────────
+workflow ANNOTATE_CNV_SV_NCKUH {
+    take:
+    cnv_wes_ch      // tuple(sample_id, gcnv_vcf, gcnv_tbi)  —— 只含 WES 樣本，可為空
+    cnv_wgs_ch      // tuple(sample_id, call_cns)            —— 只含 WGS 樣本，可為空
+    sv_ch           // tuple(sample_id, delly_vcf, delly_tbi) —— WES + WGS 共用
+
+    main:
+    // WES：gCNV VCF → AnnotSV
+    ANNOTSV_CNV_NCKUH_WES(cnv_wes_ch)
+    // WGS：CNVkit .call.cns → BED → AnnotSV
+    CNVKIT_TO_BED(cnv_wgs_ch)
+    ANNOTSV_CNV_NCKUH_WGS(CNVKIT_TO_BED.out.cnvkit_bed_ch)
+    // SV：Delly → AnnotSV
+    ANNOTSV_SV_NCKUH(sv_ch)
+
+    emit:
+    cnv_wes = ANNOTSV_CNV_NCKUH_WES.out.cnv_tsv_ch
+    cnv_wgs = ANNOTSV_CNV_NCKUH_WGS.out.cnv_tsv_ch
+    sv      = ANNOTSV_SV_NCKUH.out.sv_tsv_ch
+}
+
+// ──────────────────────────────────────────────────────────────
+// ANNOTATE_CNV_SV_DRAGEN sub-workflow：DRAGEN 的 CNV + SV annotation 車道。
+//   CNV：filter（PASS + 去 copy-neutral）→ AnnotSV；SV：filter（PASS + INS symbolic）→ AnnotSV。
+//   輸入 channel 由 main 依 sample sheet 建好傳入。
+// ──────────────────────────────────────────────────────────────
+workflow ANNOTATE_CNV_SV_DRAGEN {
+    take:
+    cnv_ch          // tuple(sample_id, cnv_vcf)
+    sv_ch           // tuple(sample_id, sv_vcf)
+
+    main:
+    PREPARE_CNV_DRAGEN(cnv_ch)
+    ANNOTSV_CNV_DRAGEN(PREPARE_CNV_DRAGEN.out.cnv_filtered_ch)
+    PREPARE_SV_DRAGEN(sv_ch)
+    ANNOTSV_SV_DRAGEN(PREPARE_SV_DRAGEN.out.sv_filtered_ch)
+
+    emit:
+    cnv = ANNOTSV_CNV_DRAGEN.out.cnv_tsv_ch
+    sv  = ANNOTSV_SV_DRAGEN.out.sv_tsv_ch
+}
