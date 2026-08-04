@@ -75,11 +75,17 @@ process PARSE_CSQ {
           emit: filtered_tsv
 
     script:
+    // ClinGen ERepo lookup 為選用：檔案尚未建立時傳 NO_FILE，CLINGEN_VCEP_* 欄位輸出 "."，
+    // 不影響其他分析（與 main_tertiary.nf 處理 clingen_hi_tsv / gene_moi 的作法一致）。
+    def erepo = (params.clingen_erepo_lookup && file(params.clingen_erepo_lookup).exists())
+        ? params.clingen_erepo_lookup : 'NO_FILE'
     """
     python3 ${params.scripts_dir}/parse_vep_csq.py \\
         --vep_vcf         ${vep_vcf} \\
         --pangolin_vcf    ${pangolin_vcf} \\
         --clinvar_lookup  ${params.clinvar_lookup_tsv} \\
+        --clingen_erepo   ${erepo} \\
+        --dbnsfp_version  ${params.academic_dbnsfp.toString().toLowerCase() == 'true' ? '5.3a' : '4.9c'} \\
         --sample_id       ${sample_id} \\
         --input_type      ${params.input_type ?: (params.pipeline_type == 'dragen' ? 'dragen' : 'ensemble')} \\
         --output_full     ${sample_id}.snv_indel.full.annotated.tsv \\

@@ -90,6 +90,11 @@ MTRN1_PATHOGENIC = {
     1494: ("m.1494C>T", "aminoglycoside-induced deafness"),
 }
 
+# MT-RNR1 coverage 閘門：某個位點要有多少深度才算「真的測過」。
+# chrM 是高拷貝數，WGS/WES 實測通常都有數百 x，DP < 10 代表這個位點基本上沒測到，
+# 不可以拿來宣告「沒有致病變異」。見 parse_mito_tsv() 的 coverage 判斷。
+MTRN1_MIN_DP = 10
+
 # guideline source 對應表
 SOURCE_MAP = {
     "CPIC Guideline Annotation": "CPIC",
@@ -291,9 +296,14 @@ def parse_mito_tsv(mito_path: str, mtrn1_vcf_data: dict | None = None) -> list[d
     邏輯：
     - mito.tsv 只有 variant calls，reference 位點不會出現
     - 找到 pathogenic 位點 → HIGH risk
-    - 找不到任何 pathogenic 位點（但有 mito.tsv）→ Reference，LOW risk
-      （代表這些位點在 mito pipeline 跑過了，只是都是 reference allele）
+    - 找不到 pathogenic 位點，且 mtrn1_vcf_data 證實至少一個位點
+      DP >= MTRN1_MIN_DP → Reference，LOW risk（只對「有測到」的位點宣告陰性；
+      其餘位點會在 NOTES / RECOMMENDATION 標明未評估）
+    - 找不到 pathogenic 位點，但三個位點都沒有足夠深度 → 不補 row（顯示 Unknown）
     - 沒有 mito.tsv → Unknown（無法判斷，不補 reference）
+
+    ⚠️ 「mito.tsv 裡沒有這個位點」不等於「這個位點是 reference」——也可能是根本沒測到。
+    兩者在 mito.tsv 裡完全無法區分，所以一定要靠 PGX_MTRN1 的 mpileup VCF 查實際深度。
     """
     rows = []
     no_mito = not mito_path or mito_path.startswith("NO_") or not os.path.exists(mito_path)
@@ -354,44 +364,75 @@ def parse_mito_tsv(mito_path: str, mtrn1_vcf_data: dict | None = None) -> list[d
         print(f"[PGX_PARSE] 警告：讀取 mito TSV 失敗：{e}", file=sys.stderr)
         return rows
 
-    # 找不到任何 pathogenic 位點
+    # ── 找不到任何 pathogenic 位點 ────────────────────────────────
+    # 這裡是唯一會輸出「Reference / LOW risk」的地方，等同於在報告上宣告
+    # 「這個病人可以正常使用 aminoglycoside」，所以必須先確認位點真的測過。
     if not found_pathogenic:
-        # 用 mtrn1_vcf_data 確認 coverage
-        # 三個位點中只要一個有 coverage（DP >= 10）就補 Reference
-        covered_positions = []
-        if mtrn1_vcf_data:
-            for pos, data in mtrn1_vcf_data.items():
-                if data.get("dp", 0) >= 10:
-                    covered_positions.append(pos)
+        # 只看 CPIC 的三個致病位點（PGX_MTRN1 的 mpileup 也只跑這三個 region；
+        # 這裡再 filter 一次，避免 VCF 混進其他 chrM 位點時被誤判成有 coverage）。
+        # bcftools mpileup 即使是 reference allele 也會輸出一行並帶 DP，
+        # 所以 DP 才有辦法區分「reference」與「沒測到」。
+        vcf_data = mtrn1_vcf_data or {}
+        covered = sorted(
+            pos for pos in MTRN1_PATHOGENIC
+            if vcf_data.get(pos, {}).get("dp", 0) >= MTRN1_MIN_DP
+        )
+        uncovered = sorted(set(MTRN1_PATHOGENIC) - set(covered))
 
-        if covered_positions or no_mito is False:
-            # 有 coverage 確認（或有 mito.tsv）→ Reference（LOW risk）
-            coverage_note = (
-                f"Coverage confirmed at chrM positions: "
-                f"{','.join(str(p) for p in sorted(covered_positions))}"
-                if covered_positions else
-                "Coverage confirmed via mito pipeline"
+        if not covered:
+            # 三個位點都沒有足夠深度（或根本沒有 mtrn1 VCF）→ 不補 row，維持 Unknown。
+            # 不可以因為「有 mito.tsv」就當成 Reference：mito.tsv 沒有這個位點，
+            # 只代表沒 call 到 variant，不代表測過。對沒測過的樣本宣告
+            # 「standard aminoglycoside dosing applies」會造成不可逆的聽力損傷。
+            print(
+                f"[PGX_PARSE] MT-RNR1：三個位點皆無足夠深度（DP < {MTRN1_MIN_DP}），"
+                f"不輸出 Reference row，維持 Unknown",
+                file=sys.stderr
             )
-            rows.append({
-                "gene":             "MT-RNR1",
-                "diplotype":        "Reference",
-                "activity_score":   ".",
-                "phenotype":        "Normal - no aminoglycoside deafness risk",
-                "drug":             "aminoglycosides (gentamicin, tobramycin, streptomycin)",
-                "guideline_source": "ClinVar/CPIC",
-                "recommendation":   (
-                    "No MT-RNR1 pathogenic variants detected (m.1555A>G, m.1494C>T, m.827A>G). "
-                    "Standard aminoglycoside dosing applies."
-                ),
-                "implication":      "No known MT-RNR1 risk variant detected",
-                "cpic_level":       "A",
-                "dpwg_level":       ".",
-                "outside_caller":   "mito_pipeline",
-                "evidence_strength": "Strong",
-                "mtrn1_risk":       "LOW",
-                "notes":            coverage_note,
-            })
-        # coverage 不足 → 不補 row，維持 Unknown
+            return rows
+
+        # 只對「確實測到」的位點宣告陰性，未測到的位點必須在報告上講明
+        assessed = ", ".join(MTRN1_PATHOGENIC[p][0] for p in covered)
+        coverage_note = (
+            f"Coverage confirmed (DP>={MTRN1_MIN_DP}) at chrM positions: "
+            f"{','.join(str(p) for p in covered)}"
+        )
+        recommendation = (
+            f"No MT-RNR1 pathogenic variants detected at assessed positions ({assessed}). "
+            "Standard aminoglycoside dosing applies."
+        )
+        if uncovered:
+            not_assessed = ", ".join(MTRN1_PATHOGENIC[p][0] for p in uncovered)
+            coverage_note += (
+                f"; NOT assessed (DP<{MTRN1_MIN_DP}): "
+                f"{','.join(str(p) for p in uncovered)}"
+            )
+            recommendation += (
+                f" NOTE: {not_assessed} could not be assessed due to insufficient depth; "
+                "consider targeted testing before aminoglycoside use if clinically indicated."
+            )
+            print(
+                f"[PGX_PARSE] MT-RNR1：部分位點深度不足（DP < {MTRN1_MIN_DP}）："
+                f"{','.join(str(p) for p in uncovered)}，已在報告標註未評估",
+                file=sys.stderr
+            )
+
+        rows.append({
+            "gene":             "MT-RNR1",
+            "diplotype":        "Reference",
+            "activity_score":   ".",
+            "phenotype":        "Normal - no aminoglycoside deafness risk",
+            "drug":             "aminoglycosides (gentamicin, tobramycin, streptomycin)",
+            "guideline_source": "ClinVar/CPIC",
+            "recommendation":   recommendation,
+            "implication":      "No known MT-RNR1 risk variant detected",
+            "cpic_level":       "A",
+            "dpwg_level":       ".",
+            "outside_caller":   "mito_pipeline",
+            "evidence_strength": "Strong",
+            "mtrn1_risk":       "LOW",
+            "notes":            coverage_note,
+        })
 
     return rows
 

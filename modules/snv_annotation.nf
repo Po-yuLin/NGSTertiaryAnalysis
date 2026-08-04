@@ -101,9 +101,14 @@ process VEP_ANNOTATE {
     //
     // 注意：apptainer_base_opts 提供 --bind /scratch,/data 基礎掛載
     //       這裡在基礎上追加 loftee 相關的 bind
+    //   NMD.pm      → Ensembl 官方 NMD plugin（VEP_plugins repo），掛進 plugin 目錄。
+    //                 用來預測「提前終止密碼子是否會逃過 NMD」，是 ClinGen SVI PVS1
+    //                 決策樹的第一個分支。容器內 /opt/vep/Plugins 唯讀，故比照 gerp bw
+    //                 以單檔 bind 方式掛入，不需重建容器。
     containerOptions "${params.apptainer_base_opts} \
         --bind ${params.loftee_dir}:/opt/vep/Plugins/loftee_data \
-        --bind ${params.loftee_dir}/gerp_conservation_scores.homo_sapiens.GRCh38.bw:/opt/vep/Plugins/gerp_conservation_scores.homo_sapiens.GRCh38.bw"
+        --bind ${params.loftee_dir}/gerp_conservation_scores.homo_sapiens.GRCh38.bw:/opt/vep/Plugins/gerp_conservation_scores.homo_sapiens.GRCh38.bw \
+        --bind ${params.loftee_dir}/NMD.pm:/opt/vep/Plugins/NMD.pm"
 
     publishDir "${params.out_dir}/${sample_id}/01_vep", mode: 'copy'
 
@@ -117,7 +122,32 @@ process VEP_ANNOTATE {
           emit: vep_out
 
     script:
+    // ── dbNSFP 版本切換（--academic_dbnsfp，預設 false）──────────────────────
+    //   false → dbNSFP 4.9c（預設路徑，維持全部工具可商用）
+    //   true  → dbNSFP 5.3a，並額外抓 REVEL / MutPred2 / VEST4 / CADD_phred
+    //           ★ 這些多為「學術免費、商業需另行授權」（CADD 尤其明確），故只在此模式取用。
+    //   兩版都已把 P-KNN 合併進去（PKNN_LLR 為最後一欄），GUI 排序訊號不受影響；
+    //   5.3a 的 P-KNN 覆蓋更完整（P-KNN 本來就是以 dbNSFP 5.3 產生）。
+    //   族群頻率欄名在 5.3a 改了：gnomAD_exomes_* → gnomAD4.1_joint_*（gnomAD 4.1，
+    //   exomes+genomes 合併），parse_vep_csq.py 以 get_any() 相容兩種欄名。
+    // ⚠️ 不要用 `as boolean`：Groovy 對非空字串一律為 true，指令列傳 "--academic_dbnsfp false"
+    //    會被誤判成開啟。一律轉小寫字串比對。
+    def academic   = params.academic_dbnsfp.toString().toLowerCase() == 'true'
+    def dbnsfp_f   = academic ? params.dbnsfp_academic : params.dbnsfp
+    // ACMG 用的族群頻率：兩版都取 gnomAD 2.1.1 exomes，讓 PM2 的判讀基準不因換版而變。
+    //   4.9c 有「整體」欄位；5.3a 只保留 controls / non_neuro / non_cancer 三個子集，
+    //   取 non_cancer（約 118k，最接近整體的 ~125k；controls 僅約 60k 差距過大）。
+    def dbnsfp_af  = academic
+        ? "gnomAD2.1.1_exomes_non_cancer_AF,gnomAD2.1.1_exomes_non_cancer_EAS_AF"
+        : "gnomAD_exomes_AF,gnomAD_exomes_EAS_AF"
+    // 5.3a 額外抓的「參考用」欄位（不進 ACMG 計分）：新 in-silico 工具 + gnomAD 4.1。
+    def dbnsfp_extra = academic
+        ? ",REVEL_score,MutPred2_score,MutPred2_pred,VEST4_score,CADD_phred" +
+          ",gnomAD4.1_joint_AF,gnomAD4.1_joint_EAS_AF"
+        : ""
     """
+    echo "[VEP_ANNOTATE] dbNSFP = ${dbnsfp_f}" >&2
+
     vep \\
         --input_file ${snv_vcf} \\
         --output_file ${sample_id}.vep.vcf.gz \\
@@ -135,6 +165,7 @@ process VEP_ANNOTATE {
         --hgvs \\
         --symbol \\
         --numbers \\
+        --total_length \\
         --canonical \\
         --biotype \\
         --tsl \\
@@ -146,7 +177,7 @@ process VEP_ANNOTATE {
         --flag_pick \\
         --pick_order mane_select,mane_plus_clinical,canonical,appris,tsl,biotype,ccds,rank,length \\
         \\
-        --plugin dbNSFP,${params.dbnsfp},\\
+        --plugin dbNSFP,${dbnsfp_f},\\
 BayesDel_noAF_score,BayesDel_noAF_pred,\\
 AlphaMissense_score,AlphaMissense_pred,\\
 ESM1b_score,ESM1b_pred,\\
@@ -156,8 +187,8 @@ DANN_score,\\
 PHACTboost_score,\\
 phyloP100way_vertebrate,\\
 GERP++_RS,\\
-gnomAD_exomes_AF,gnomAD_exomes_EAS_AF,\\
-PKNN_LLR \\
+${dbnsfp_af},\\
+PKNN_LLR${dbnsfp_extra} \\
         \\
         --plugin LoF,\\
 loftee_path:/opt/vep/Plugins/,\\
@@ -166,6 +197,8 @@ conservation_file:/opt/vep/Plugins/loftee_data/loftee.sql,\\
 gerp_bigwig:/opt/vep/Plugins/loftee_data/gerp_conservation_scores.homo_sapiens.GRCh38.bw \\
         \\
         --plugin LoFtool,/opt/vep/Plugins/loftee_data/LoFtool_scores.txt \\
+        \\
+        --plugin NMD \\
         \\
         --custom file=${params.clinvar},short_name=ClinVar,format=vcf,type=exact,coords=0,fields=CLNSIG%CLNREVSTAT%CLNDN%CLNSIGCONF \\
         \\
@@ -191,7 +224,18 @@ gerp_bigwig:/opt/vep/Plugins/loftee_data/gerp_conservation_scores.homo_sapiens.G
 process PANGOLIN_SCORE {
     label 'process_gpu'
 
-    container "${params.sif_dir}/pangolin_1.0.0.sif"
+    // ── 容器依機器的 GPU 世代切換（params.pangolin_sif，每個 profile 都要宣告）──
+    //   Pangolin 用 PyTorch，而 PyTorch 的 prebuilt wheel 只包特定 compute
+    //   capability 的 kernel，跨 GPU 世代不相容（cubin 只在同一個 major 版本內
+    //   向前相容）。實測官方 wheel 的 arch list：
+    //     cu121 → sm_50…sm_90   （含 sm_70 = V100，無 sm_120）
+    //     cu128 → sm_75…sm_120  （含 sm_120 = Blackwell，**已砍 sm_70**；cu130 同理）
+    //   → 沒有任何一顆 prebuilt wheel 同時涵蓋兩者，只能分成兩顆容器：
+    //     pangolin_cu121_1.0.0.sif → production：dgm + dgx（V100 = sm_70）
+    //     pangolin_cu130_1.0.0.sif → 開發機 local（RTX PRO 6000 Blackwell = sm_120）
+    //   檔名標的是 CUDA 變體而非機器，因為差異的本質就是 wheel 的 CUDA 變體。
+    //   建置方式與 arch 守門員見 DEVELOPMENT_NOTES.md「容器建立 → Pangolin」。
+    container "${params.sif_dir}/${params.pangolin_sif}"
 
     publishDir "${params.out_dir}/${sample_id}/02_pangolin", mode: 'copy'
 
@@ -205,7 +249,43 @@ process PANGOLIN_SCORE {
           emit: pangolin_out
 
     script:
+    // ── GPU lock（DGX-2 共用機器）─────────────────────────────────────────
+    //   與二級分析同一套機制：gpu_lock.sh 搶下 N 張空閒 V100 並輸出可 eval 的環境變數，
+    //   trap EXIT 時以 gpu_unlock.sh 歸還（即使 process 失敗也會釋放）。
+    //   Apptainer 預設會把 host 環境變數帶進容器，故 CUDA_VISIBLE_DEVICES 會被 Pangolin
+    //   看見；這裡再明確 export 一次，避免 lock script 只設了 MY_GPUS。
+    //   非 DGX（local / dgm）use_gpu_lock=false → 走 config 既有的 GPU 設定，不插入此段。
+    // ── GPU / CPU 切換（--use_gpu_pangolin）──────────────────────────────
+    //   Pangolin 以 PyTorch 實作，會自動偵測 CUDA；把 CUDA_VISIBLE_DEVICES 設為空字串
+    //   即可強制走 CPU（慢但結果相同），讓 pipeline 能部署到沒有 GPU 的環境。
+    //   容器的 --nv 由 config 的 process_gpu label 依同一參數決定是否加上。
+    def use_gpu       = params.use_gpu_pangolin == null ? true
+                        : params.use_gpu_pangolin.toString().toLowerCase() == 'true'
+    // ⚠️ use_gpu_lock / pangolin_num_gpus 只宣告在 profile 內（不能放全域 params 區塊，
+    //    那個區塊在 profiles 之後會蓋掉 profile 的值）。但 Nextflow 只要「讀到」未宣告的
+    //    param 就會噴 "WARN: Access to undefined parameter" —— 即使後面接了 ?: 預設值也一樣。
+    //    所以用 containsKey 先問再讀：三個 profile 都已宣告，這層只是保險，
+    //    讓「沒帶 -profile」或「將來新增 profile 忘了宣告」時不會噴 warning 也不會壞。
+    // 不用 GPU 就不必搶卡
+    def use_lock      = use_gpu &&
+                        (params.containsKey('use_gpu_lock') ? params.use_gpu_lock : false)
+    def lock_script   = params.gpu_lock_script
+    def unlock_script = params.gpu_unlock_script
+    def num_gpus      = params.containsKey('pangolin_num_gpus') ? params.pangolin_num_gpus : 1
+    def gpu_block = !use_gpu ? """
+    export CUDA_VISIBLE_DEVICES=""
+    echo "[PANGOLIN] ${sample_id} CPU 模式（use_gpu_pangolin=false）" >&2
+    """ : use_lock ? """
+    eval \$(bash ${lock_script} ${num_gpus})
+    export CUDA_VISIBLE_DEVICES=\${MY_GPUS}
+    echo "[PANGOLIN] ${sample_id} 取得 GPU \${MY_GPUS}" >&2
+    trap "bash ${unlock_script} \${MY_GPUS}; echo '[PANGOLIN] ${sample_id} 釋放 GPU \${MY_GPUS}' >&2" EXIT
+    """ : """
+    echo "[PANGOLIN] ${sample_id} 使用 config 指定的 GPU（未啟用 GPU lock）" >&2
     """
+    """
+    ${gpu_block}
+
     # Step 1：從 VEP 輸出中篩選 splice candidate
     # bcftools view -h → 只取 header 行
     # bcftools view -H → 只取 variant 行，awk 篩 INFO 欄含 "splice" 字眼

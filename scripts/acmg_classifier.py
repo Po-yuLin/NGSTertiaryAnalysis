@@ -202,6 +202,10 @@ _MOI_TABLE: dict[str, str] = {}
 CRITERIA_POINTS = {
     # ── 致病性（正分）
     "PVS1":             8,   # Very Strong
+    # ClinGen SVI 決策樹的降級版本（Abou Tayoun 2018）：同一條 PVS1 依情境給不同權重
+    "PVS1_Strong":      4,
+    "PVS1_Moderate":    2,
+    "PVS1_Supporting":  1,
     "PS1":              4,   # Strong
     "PS2":              4,
     "PS3":              4,
@@ -279,7 +283,60 @@ EXPECTED_COLUMNS = [
     "HGNC_ID",                                                       # 60  ★ v3.1
 ]
 
-NEW_COLUMNS = ["ACMG_CRITERIA", "ACMG_SCORE", "ACMG_CLASS", "ACMG_NOTES"]
+NEW_COLUMNS = ["ACMG_CRITERIA", "ACMG_SCORE", "ACMG_CLASS", "ACMG_NOTES",
+               "CLINGEN_AGREEMENT",
+               # PVS1 決策樹的結果單獨開欄，方便審閱者直接篩「被降級的 LoF」
+               "PVS1_STRENGTH", "PVS1_REASON"]
+
+
+# ──────────────────────────────────────────────────────────────
+# 與 ClinGen VCEP 專家判讀的一致性對照（★ 純比對，不影響 ACMG 計分）
+# ──────────────────────────────────────────────────────────────
+# ClinGen SVI 2018 建議不要用 PP5/BP6（把他人判讀當成證據），否則變成循環論證，
+# 因此本 pipeline 未實作 PP5/BP6；ERepo 的專家判讀只用來「對照」我們的自動判讀結果，
+# 讓審閱者一眼看出哪些變異與專家小組結論不同、值得優先人工複核。
+_CLASS_CANON = {
+    "pathogenic": "P",
+    "likely pathogenic": "LP", "likely_pathogenic": "LP",
+    "uncertain significance": "VUS", "vus": "VUS",
+    "variant of uncertain significance": "VUS",
+    "likely benign": "LB", "likely_benign": "LB",
+    "benign": "B",
+}
+_DIRECTION = {"P": "path", "LP": "path", "VUS": "vus", "LB": "benign", "B": "benign"}
+
+
+def _canon_class(value: str) -> str | None:
+    """把我們與 ERepo 的分類字串正規化成 P / LP / VUS / LB / B；無法對應回 None。"""
+    s = (value or "").strip().lower()
+    if not s or s == ".":
+        return None
+    if s in _CLASS_CANON:
+        return _CLASS_CANON[s]
+    # ERepo 可能出現 "Pathogenic (moderate penetrance)" 等變體 → 取最長的前綴比對
+    for key in sorted(_CLASS_CANON, key=len, reverse=True):
+        if s.startswith(key):
+            return _CLASS_CANON[key]
+    return None
+
+
+def clingen_agreement(our_class: str, vcep_class: str) -> str:
+    """
+    回傳：
+      "."            未被 VCEP 判讀（或無法解析）→ 無從比較
+      AGREE          與專家判讀同一級
+      DIFFER_TIER    方向相同、強度不同（如我們 LP、專家 P）→ 通常可接受
+      DIFFER         方向不同（含一方為 VUS）→ 建議人工複核
+    """
+    ours = _canon_class(our_class)
+    theirs = _canon_class(vcep_class)
+    if ours is None or theirs is None:
+        return "."
+    if ours == theirs:
+        return "AGREE"
+    if _DIRECTION[ours] == _DIRECTION[theirs]:
+        return "DIFFER_TIER"
+    return "DIFFER"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -368,30 +425,144 @@ def check_PVS1(row: dict) -> tuple[bool, str]:
         不在 ClinGen → 不觸發，標記 manual_review
         _HI_TABLE 為空 → 簡化版，直接觸發（向後相容）
     """
-    loftee        = row.get("LOFTEE", ".")
-    loftee_filter = row.get("LOFTEE_FILTER", ".")
-    gene          = row.get("GENE", ".")
+    strength, note = pvs1_decision_tree(row)
+    return (strength is not None), note
 
-    # Step 1：LOFTEE HC 才進入後續判斷
-    if not (loftee == "HC" and loftee_filter == "."):
-        return False, ""
 
-    # Step 2：若 HI table 未載入 → 簡化版
-    if not _HI_TABLE:
-        return True, f"PVS1:LOFTEE=HC(simplified)"
+# ──────────────────────────────────────────────────────────────
+# ClinGen SVI PVS1 決策樹（Abou Tayoun et al. 2018, Hum Mutat 39:1517）
+# ──────────────────────────────────────────────────────────────
+# 舊版是「LOFTEE HC + ClinGen HI=3 → 直接給滿分 PVS1」的二元判斷。SVI 指出這樣過度
+# 樂觀：predicted LoF 仍可能因為逃過 NMD、只截掉蛋白尾端、或落在非關鍵區域而效應有限，
+# 因此應**依情境降級**為 Strong / Moderate / Supporting。
+#
+# 本實作的分支（僅處理 SNV/indel，CNV 由 AnnotSV 另行處理）：
+#
+#   前置閘門：LoF 必須是該基因的已知致病機轉 → ClinGen Dosage HI score = 3
+#             （HI=2 emerging、HI=30 AR-only、不在清單 → 不觸發，標記人工複核）
+#
+#   nonsense / frameshift：
+#       需 LOFTEE HC（LOFTEE 判定為 low-confidence 者不進決策樹）
+#       ├─ 預測會被 NMD 降解            → PVS1（Very Strong）
+#       └─ 逃過 NMD（NMD escape）
+#            ├─ 截斷區含已知功能 domain → PVS1_Strong
+#            ├─ 移除 >10% 蛋白質        → PVS1_Strong
+#            └─ 其餘                    → PVS1_Moderate
+#
+#   splice ±1,2：同上（讀框破壞 + NMD → PVS1；否則依 domain / 截斷比例降級）
+#
+#   start_lost（起始密碼子）：SVI 對此類最高只給 Moderate → PVS1_Moderate
+#
+# ⚠️ 已知簡化（評鑑時應主動說明）：
+#   1.「截斷區是否為關鍵功能區」以 VEP DOMAINS 欄位是否非空作為代理指標；SVI 原意是
+#      「已建立的功能域或已知致病變異密集區」，本實作偏寬鬆。
+#   2. 未實作「下游 LoF 變異在族群中常見（>0.1%）→ 不算 PVS1」這條分支（需 gnomAD
+#      per-region LoF 頻率統計）。
+#   3. exon skipping 是否維持讀框，以 NMD 預測與截斷比例近似，未逐一計算 exon 長度。
+#   以上皆會反映在 PVS1_REASON 欄，供人工複核。
 
-    # Step 3：查 HI score
-    hi_score = _HI_TABLE.get(gene)
+PVS1_STRENGTHS = ("PVS1", "PVS1_Strong", "PVS1_Moderate", "PVS1_Supporting")
 
-    if hi_score is None:
-        return False, f"PVS1_NOT_TRIGGERED:gene={gene},HI=not_in_ClinGen(manual_review)"
-    if hi_score == 3:
-        return True, f"PVS1:LOFTEE=HC,gene={gene},HI=3"
-    if hi_score == 2:
-        return False, f"PVS1_NOT_TRIGGERED:gene={gene},HI=2(emerging,manual_review)"
-    if hi_score == 30:
-        return False, f"PVS1_NOT_TRIGGERED:gene={gene},HI=30(AR_only)"
-    return False, f"PVS1_NOT_TRIGGERED:gene={gene},HI={hi_score}(insufficient)"
+_NONSENSE_CSQ = ("stop_gained", "frameshift_variant")
+_SPLICE_CSQ   = ("splice_donor_variant", "splice_acceptor_variant")
+_START_CSQ    = ("start_lost", "initiator_codon_variant")
+
+# 移除超過此比例的蛋白質 → 視為影響重大（SVI 決策樹的 10% 門檻）
+PVS1_TRUNCATION_FRACTION = 0.10
+
+
+def _protein_truncation_fraction(row: dict) -> float | None:
+    """
+    由 PROTEIN_POSITION（VEP --total_length 產生的 "123/456"）算出「被移除的蛋白比例」。
+    回傳 0~1；無法解析回 None。
+    """
+    val = (row.get("PROTEIN_POSITION") or ".").strip()
+    if not val or val == "." or "/" not in val:
+        return None
+    pos_part, _, total_part = val.partition("/")
+    pos_part = pos_part.split("-")[0].strip()      # 範圍如 "123-125" 取起點
+    try:
+        pos = float(pos_part)
+        total = float(total_part.strip())
+    except ValueError:
+        return None
+    if total <= 0 or pos <= 0:
+        return None
+    return max(0.0, min(1.0, (total - pos) / total))
+
+
+def _escapes_nmd(row: dict) -> bool:
+    """VEP NMD plugin：輸出含 NMD_escaping_variant 代表逃過 NMD。"""
+    return "escap" in (row.get("NMD") or "").lower()
+
+
+def _in_functional_domain(row: dict) -> bool:
+    """代理指標：VEP DOMAINS 欄位非空 → 視為落在已知功能域（見上方簡化說明 1）。"""
+    d = (row.get("DOMAINS") or ".").strip()
+    return bool(d) and d != "."
+
+
+def pvs1_decision_tree(row: dict) -> tuple[str | None, str]:
+    """
+    回傳 (strength, reason)。strength 為 PVS1_STRENGTHS 之一或 None（不觸發）。
+    reason 會記錄走過的分支，便於人工複核與評鑑說明。
+    """
+    gene        = row.get("GENE", ".")
+    csq         = (row.get("CONSEQUENCE") or "").lower()
+    loftee      = row.get("LOFTEE", ".")
+    loftee_flt  = row.get("LOFTEE_FILTER", ".")
+
+    is_nonsense = any(c in csq for c in _NONSENSE_CSQ)
+    is_splice   = any(c in csq for c in _SPLICE_CSQ)
+    is_start    = any(c in csq for c in _START_CSQ)
+    if not (is_nonsense or is_splice or is_start):
+        return None, ""
+
+    # ── 前置閘門：LoF 是否為此基因的已知致病機轉（ClinGen Dosage HI）──────────
+    if _HI_TABLE:
+        hi = _HI_TABLE.get(gene)
+        if hi is None:
+            return None, f"PVS1_NOT_TRIGGERED:gene={gene},HI=not_in_ClinGen(manual_review)"
+        if hi == 2:
+            return None, f"PVS1_NOT_TRIGGERED:gene={gene},HI=2(emerging,manual_review)"
+        if hi == 30:
+            return None, f"PVS1_NOT_TRIGGERED:gene={gene},HI=30(AR_only)"
+        if hi != 3:
+            return None, f"PVS1_NOT_TRIGGERED:gene={gene},HI={hi}(insufficient)"
+        hi_note = f"gene={gene},HI=3"
+    else:
+        hi_note = f"gene={gene},HI=table_unavailable"
+
+    # ── 起始密碼子：SVI 對此類最高給 Moderate ────────────────────────────────
+    if is_start and not (is_nonsense or is_splice):
+        return "PVS1_Moderate", f"PVS1_Moderate:start_lost,{hi_note}"
+
+    # ── nonsense / frameshift / splice±1,2：需 LOFTEE 高信心 ─────────────────
+    if not (loftee == "HC" and loftee_flt == "."):
+        return None, (f"PVS1_NOT_TRIGGERED:LOFTEE={loftee}"
+                      f"{'/' + loftee_flt if loftee_flt not in ('.', '') else ''}"
+                      f"(low_confidence),{hi_note}")
+
+    kind = "nonsense/frameshift" if is_nonsense else "splice±1,2"
+
+    # 分支 1：是否逃過 NMD
+    if not _escapes_nmd(row):
+        nmd_state = "NMD_predicted" if (row.get("NMD") or ".") != "." else "NMD_unknown"
+        return "PVS1", f"PVS1:{kind},{nmd_state},LOFTEE=HC,{hi_note}"
+
+    # 分支 2：逃過 NMD → 依關鍵區域 / 截斷比例降級
+    if _in_functional_domain(row):
+        return "PVS1_Strong", (f"PVS1_Strong:{kind},NMD_escape,"
+                               f"in_functional_domain,{hi_note}")
+
+    frac = _protein_truncation_fraction(row)
+    if frac is not None and frac > PVS1_TRUNCATION_FRACTION:
+        return "PVS1_Strong", (f"PVS1_Strong:{kind},NMD_escape,"
+                               f"removes_{frac * 100:.0f}%_of_protein,{hi_note}")
+
+    frac_note = f"removes_{frac * 100:.0f}%_of_protein" if frac is not None \
+        else "truncation_fraction_unknown"
+    return "PVS1_Moderate", f"PVS1_Moderate:{kind},NMD_escape,{frac_note},{hi_note}"
 
 
 def check_PM2(row: dict) -> tuple[bool, str]:
@@ -683,13 +854,14 @@ def classify_variant(row: dict) -> dict:
         af = max_af(row)
         notes_parts.append(f"BS1:gnomAD_AF={af:.4f}>1%")
 
-    # ── PVS1 ─────────────────────────────────────────────────────────
-    pvs1_triggered, pvs1_note = check_PVS1(row)
+    # ── PVS1（ClinGen SVI 決策樹：依 NMD / 功能域 / 截斷比例分級）──────────
+    pvs1_strength, pvs1_note = pvs1_decision_tree(row)
+    pvs1_triggered = pvs1_strength is not None
     if pvs1_triggered:
-        triggered_criteria.append("PVS1")
+        triggered_criteria.append(pvs1_strength)   # PVS1 / _Strong / _Moderate / _Supporting
         notes_parts.append(pvs1_note)
     elif pvs1_note:
-        # 未觸發但有值得關注的資訊（HI=2 或不在 ClinGen）→ 記錄
+        # 未觸發但有值得關注的資訊（HI=2、不在 ClinGen、LOFTEE 低信心）→ 記錄
         notes_parts.append(pvs1_note)
 
     # ── PM2_Supporting ────────────────────────────────────────────────
@@ -793,6 +965,8 @@ def process_tsv(
 
     n_total = n_p = n_lp = n_vus = n_lb = n_b = 0
     criteria_counts: dict[str, int] = {}
+    agreement_counts: dict[str, int] = {}
+    pvs1_counts: dict[str, int] = {}
 
     with opener_in(input_path, "rt") as fin, open(output_path, "w") as fout:
 
@@ -827,11 +1001,27 @@ def process_tsv(
                 for crit in result["ACMG_CRITERIA"].split(","):
                     criteria_counts[crit] = criteria_counts.get(crit, 0) + 1
 
+            # 與 ClinGen VCEP 專家判讀比對（欄位不存在時為 "."，不影響上面的計分結果）
+            agreement = clingen_agreement(
+                result["ACMG_CLASS"],
+                row.get("CLINGEN_VCEP_CLASS", "."),
+            )
+            if agreement != ".":
+                agreement_counts[agreement] = agreement_counts.get(agreement, 0) + 1
+
+            # PVS1 決策樹結果（獨立欄位；不影響已計算好的 ACMG_SCORE）
+            pvs1_strength, pvs1_reason = pvs1_decision_tree(row)
+            if pvs1_strength:
+                pvs1_counts[pvs1_strength] = pvs1_counts.get(pvs1_strength, 0) + 1
+
             fout.write("\t".join(fields + [
                 result["ACMG_CRITERIA"],
                 result["ACMG_SCORE"],
                 result["ACMG_CLASS"],
                 result["ACMG_NOTES"],
+                agreement,
+                pvs1_strength or ".",
+                pvs1_reason or ".",
             ]) + "\n")
 
     print(f"\n[acmg_classifier] 完成，共 {n_total:,} 個 variant", file=sys.stderr)
@@ -843,6 +1033,24 @@ def process_tsv(
     print(f"\n  ── Criteria 觸發次數 ──", file=sys.stderr)
     for crit, cnt in sorted(criteria_counts.items(), key=lambda x: -x[1]):
         print(f"  {crit:<25} : {cnt:>6,}", file=sys.stderr)
+
+    if pvs1_counts:
+        print(f"\n  ── PVS1 決策樹分級（ClinGen SVI, Abou Tayoun 2018）──", file=sys.stderr)
+        for label in PVS1_STRENGTHS:
+            cnt = pvs1_counts.get(label, 0)
+            if cnt:
+                print(f"  {label:<18}: {cnt:>6,}", file=sys.stderr)
+
+    # ClinGen VCEP 對照摘要（只有提供 ERepo lookup 時才會有數字）
+    if agreement_counts:
+        n_cmp = sum(agreement_counts.values())
+        print(f"\n  ── 與 ClinGen VCEP 專家判讀比對（{n_cmp:,} 個變異有專家判讀）──",
+              file=sys.stderr)
+        for label, desc in (("AGREE", "同一級"),
+                            ("DIFFER_TIER", "方向相同、強度不同"),
+                            ("DIFFER", "方向不同 → 建議人工複核")):
+            cnt = agreement_counts.get(label, 0)
+            print(f"  {label:<12}（{desc}）: {cnt:>6,}", file=sys.stderr)
 
 
 # ══════════════════════════════════════════════════════════════════

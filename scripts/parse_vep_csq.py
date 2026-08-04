@@ -71,6 +71,7 @@ parse_vep_csq.py
 import argparse
 import gzip
 import json
+import os
 import re
 import sys
  
@@ -231,6 +232,36 @@ def load_clinvar_lookup(lookup_path: str) -> dict:
  
     print(f"[parse_vep_csq] ClinVar lookup 載入完成：{len(lookup):,} 筆", file=sys.stderr)
     return lookup
+
+
+def load_clingen_erepo(lookup_path: str) -> dict:
+    """
+    載入 clingen_erepo_lookup.tsv.gz（build_clingen_erepo_lookup.py 產生）。
+    回傳 {variation_id: (class, criteria, panel)} dict。
+
+    ClinGen Evidence Repository = 各 VCEP 專家小組的變異判讀，含實際套用的 ACMG criteria。
+    ⚠️ 只作「對照」用（跟我們自動 ACMG 比對），不參與計分 —— ClinGen SVI 2018 建議不要用
+       PP5/BP6（拿他人判讀當證據），本 pipeline 也未實作 PP5/BP6，這裡維持同一原則。
+    路徑傳 NO_FILE 或空字串 → 回傳空 dict（欄位輸出 "."），不影響其他分析。
+    """
+    lookup = {}
+    if not lookup_path or lookup_path == "NO_FILE" or not os.path.exists(lookup_path):
+        print("[parse_vep_csq] 未提供 ClinGen ERepo lookup，CLINGEN_VCEP_* 欄位將為 '.'",
+              file=sys.stderr)
+        return lookup
+
+    opener = gzip.open if lookup_path.endswith(".gz") else open
+    print(f"[parse_vep_csq] 載入 ClinGen ERepo lookup：{lookup_path}", file=sys.stderr)
+    with opener(lookup_path, "rt") as f:
+        f.readline()  # 跳過 header
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 4:
+                continue
+            lookup[parts[0]] = (parts[1], parts[2], parts[3])
+
+    print(f"[parse_vep_csq] ClinGen ERepo lookup 載入完成：{len(lookup):,} 筆", file=sys.stderr)
+    return lookup
  
  
 # ──────────────────────────────────────────────────────────────
@@ -300,6 +331,20 @@ def parse_csq_fields(vcf_path: str) -> dict:
 def get(tx: dict, field: str) -> str:
     val = tx.get(field, "")
     return val if val else "."
+
+
+def get_any(tx: dict, *fields: str) -> str:
+    """
+    依序嘗試多個 CSQ 欄名，回傳第一個有值的；全都沒有則回 "."。
+    用於 dbNSFP 版本間的欄位改名，例如族群頻率：
+      4.9c → gnomAD_exomes_AF / gnomAD_exomes_EAS_AF
+      5.3a → gnomAD4.1_joint_AF / gnomAD4.1_joint_EAS_AF（改用 gnomAD 4.1 joint）
+    """
+    for f in fields:
+        val = tx.get(f, "")
+        if val:
+            return val
+    return "."
  
  
 # ──────────────────────────────────────────────────────────────
@@ -579,6 +624,21 @@ OUTPUT_COLUMNS = [
     "DOMAINS", "SWISSPROT",
     # Gene identifier
     "HGNC_ID",                      # ★ v3.1：HGNC ID（VEP cache 內建，--symbol 旗標啟用）
+    # ClinGen Evidence Repository（VCEP 專家判讀；★ 僅供對照，不進 ACMG 計分）
+    #   刻意附加在最後面：不動既有欄位順序，下游用欄位索引取值的腳本才不會位移。
+    "CLINGEN_VCEP_CLASS",           # 專家小組的判讀結論
+    "CLINGEN_VCEP_CRITERIA",        # 專家小組實際套用的 ACMG criteria
+    "CLINGEN_VCEP_PANEL",           # 判讀的 VCEP 名稱
+    # dbNSFP 5.3a 專屬預測工具（★ 僅 --academic_dbnsfp 開啟時才有值，否則為 "."）
+    #   這些工具多為「學術免費、商業需另行授權」（CADD 尤其明確），故不放在預設路徑，
+    #   以維持預設流程全部可商用的硬性限制。
+    "REVEL", "MUTPRED2", "MUTPRED2_PRED", "VEST4", "CADD_PHRED",
+    # gnomAD 4.1 joint：★ 參考用，不進 ACMG 計分（ACMG 一律用上面的 2.1.1 欄位）
+    "GNOMAD41_JOINT_AF", "GNOMAD41_JOINT_EAS_AF",
+    "DBNSFP_VERSION",               # 這批分數來自哪個 dbNSFP（4.9c / 5.3a）
+    # ClinGen SVI PVS1 決策樹（Abou Tayoun 2018）所需的原始欄位
+    "NMD",                          # VEP NMD plugin：是否逃過 nonsense-mediated decay
+    "PROTEIN_POSITION",             # Protein_position（--total_length → "123/456"），算截斷比例用
 ]
  
  
@@ -625,7 +685,9 @@ def strand_bias_flag(info_dict: dict, ref: str, alt: str) -> str:
 def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
                   clinvar_lookup: dict, sample_id: str,
                   output_full: str, output_filtered: str,
-                  input_type: str = "ensemble"):
+                  input_type: str = "ensemble",
+                  clingen_erepo: dict | None = None,
+                  dbnsfp_version: str = "4.9c"):
  
     csq_fields = parse_csq_fields(vep_vcf)
     opener = gzip.open if vep_vcf.endswith(".gz") else open
@@ -742,6 +804,18 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
             else:
                 cv_varid, cv_omim, cv_rs = ".", ".", "."
 
+            # ClinGen ERepo（VCEP 專家判讀）對照：先用 ClinVar Variation ID，
+            # 查不到再用 GRCh38 座標（ERepo 約 5% 的判讀沒有 ClinVar ID，僅有座標）。
+            cg_class, cg_criteria, cg_panel = ".", ".", "."
+            if clingen_erepo:
+                cg_hit = None
+                if cv_varid != ".":
+                    cg_hit = clingen_erepo.get(cv_varid)
+                if cg_hit is None:
+                    cg_hit = clingen_erepo.get(lookup_key)
+                if cg_hit is not None:
+                    cg_class, cg_criteria, cg_panel = cg_hit
+
             # rsID 和 ClinVar 從第一個 transcript 取（variant-level annotation）
             first_tx = picked_txs[0][0]
             rs_id_vep = extract_rs_id(get(first_tx, "Existing_variation"))
@@ -768,8 +842,19 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
                 gnomad_g_eas_af    = get(picked_tx, "gnomADg_EAS_AF")
                 gnomad_e_af        = get(picked_tx, "gnomADe_AF")
                 gnomad_e_eas_af    = get(picked_tx, "gnomADe_EAS_AF")
-                gnomad_e_af_db     = get(picked_tx, "gnomAD_exomes_AF")
-                gnomad_e_eas_af_db = get(picked_tx, "gnomAD_exomes_EAS_AF")
+                # ACMG 用的族群頻率固定取 gnomAD 2.1.1 exomes，換 dbNSFP 版本不改判讀基準。
+                #   4.9c：gnomAD_exomes_*（整體）
+                #   5.3a：只有子集 → 取 non_cancer（最接近整體）
+                # 註：GNOMAD_E_AF_DBNSFP 目前未進 ACMG（純顯示）；GNOMAD_E_EAS_AF_DBNSFP
+                #     只在 AR/XL 的 PM2 作為 min_eas_af() 四個來源之一。
+                gnomad_e_af_db     = get_any(picked_tx, "gnomAD_exomes_AF",
+                                                        "gnomAD2.1.1_exomes_non_cancer_AF")
+                gnomad_e_eas_af_db = get_any(picked_tx, "gnomAD_exomes_EAS_AF",
+                                                        "gnomAD2.1.1_exomes_non_cancer_EAS_AF")
+                # gnomAD 4.1 joint（exomes+genomes，~80 萬人）：僅 5.3a 模式有值，
+                # 純參考欄位、不進 ACMG 計分，供審閱者對照新版族群頻率。
+                gnomad41_af     = get(picked_tx, "gnomAD4.1_joint_AF")
+                gnomad41_eas_af = get(picked_tx, "gnomAD4.1_joint_EAS_AF")
                 tg_eas_af          = get(picked_tx, "EAS_AF")
 
                 loftee        = get(picked_tx, "LoF")
@@ -858,6 +943,20 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
                     "DOMAINS":              domains,
                     "SWISSPROT":            swissprot,
                     "HGNC_ID":              hgnc_id,
+                    "CLINGEN_VCEP_CLASS":    cg_class,
+                    "CLINGEN_VCEP_CRITERIA": cg_criteria,
+                    "CLINGEN_VCEP_PANEL":    cg_panel,
+                    # 5.3a 專屬工具：4.9c 模式下 CSQ 沒有這些欄位 → get() 回 "."
+                    "REVEL":                get(picked_tx, "REVEL_score"),
+                    "MUTPRED2":             get(picked_tx, "MutPred2_score"),
+                    "MUTPRED2_PRED":        get(picked_tx, "MutPred2_pred"),
+                    "VEST4":                get(picked_tx, "VEST4_score"),
+                    "CADD_PHRED":           get(picked_tx, "CADD_phred"),
+                    "GNOMAD41_JOINT_AF":     gnomad41_af,
+                    "GNOMAD41_JOINT_EAS_AF": gnomad41_eas_af,
+                    "DBNSFP_VERSION":       dbnsfp_version,
+                    "NMD":                  get(picked_tx, "NMD"),
+                    "PROTEIN_POSITION":     get(picked_tx, "Protein_position"),
                 }
 
                 row_str = "\t".join(row_dict[col] for col in OUTPUT_COLUMNS) + "\n"
@@ -888,6 +987,11 @@ def main():
     parser.add_argument("--pangolin_vcf",     required=True)
     parser.add_argument("--clinvar_lookup",   required=True,
                         help="clinvar_lookup.tsv.gz（build_clinvar_lookup.py 產生）")
+    parser.add_argument("--dbnsfp_version",   default="4.9c",
+                        help="這次 VEP 用的 dbNSFP 版本（4.9c 或 5.3a），寫入 DBNSFP_VERSION 欄")
+    parser.add_argument("--clingen_erepo",    default="NO_FILE",
+                        help="clingen_erepo_lookup.tsv.gz（build_clingen_erepo_lookup.py 產生）；"
+                             "選用，未提供則 CLINGEN_VCEP_* 欄位為 '.'")
     parser.add_argument("--sample_id",        required=True)
     parser.add_argument("--output_full",      required=True,
                         help="完整輸出 TSV（archive 用）")
@@ -904,12 +1008,15 @@ def main():
           file=sys.stderr)
  
     clinvar_lookup = load_clinvar_lookup(args.clinvar_lookup)
- 
+    clingen_erepo  = load_clingen_erepo(args.clingen_erepo)
+
     print(f"[parse_vep_csq] 解析 VEP VCF：{args.vep_vcf}", file=sys.stderr)
     parse_vep_vcf(
         args.vep_vcf, pangolin_scores, clinvar_lookup,
         args.sample_id, args.output_full, args.output_filtered,
         input_type=args.input_type,
+        clingen_erepo=clingen_erepo,
+        dbnsfp_version=args.dbnsfp_version,
     )
  
  
