@@ -1,9 +1,31 @@
 # 臨床三級分析 Pipeline 使用說明
 
-**版本：v3.6**
-**更新日期：2026-08-03**
+**版本：v3.8**
+**更新日期：2026-09-24**
 **負責人：林伯昱（p88124019@gs.ncku.edu.tw）**
 
+> v3.8 更新（VAL-10 女性 DRAGEN 驗證後的修正）：
+> - DRAGEN：`COMBINE_DRAGEN` 只拿 PASS 紀錄做 compound 合成（chrM 除外）。舊版連 non-PASS 一起合，
+>   合成紀錄沿用最寬那筆的 FILTER → 可能把 PASS 變異一起丟掉，或把 DRAGEN 濾掉的 allele 拼進報告。
+> - `ZYGOSITY` 看 GT 的套數：單套才是 `hemizygous`；性染色體上的雙套 `1/1`（女性 chrX、男性 PAR）是 `hom`
+>   （舊版一律標 `hemizygous`）。欄位不變，仍是 82 欄。
+> - compound 合成（`combine_phased.py`，二級 NCKUH 與三級 DRAGEN 共用）：**phase 未知的重疊 het 不再合成**，
+>   重疊只落在錨定鹼基上才合，否則原封保留。舊版把它們當成同一條單體，VAL-10 有 **7,927 個 PASS 變異**因此
+>   從報告消失（例：缺失範圍內的 SNV），另有 1,435 處寫出沒人 call 的變異。`COMBINE_DRAGEN` 的 stderr 多了
+>   `phase_unknown=`、`overlap_conflict=`。NCKUH 在下次二級重跑時生效。
+> - DRAGEN：拆開多等位紀錄後，樣本沒帶的 allele（GT `0/0`）不再進報告。舊版會多出 `ZYGOSITY=ref` 的假列，
+>   例如 CYP21A2 `c.293-13C>G`（樣本其實是 A/A）。
+>
+> v3.7 更新（VAL55 SUZ12 驗證後的修正）：
+> - NCKUH：兩個 caller 都沒有 ALT 的紀錄標成 `CALLERS=NONE`、**不進 annotation**（舊版標成 `HC`，
+>   報告會多出不存在的變異，例如 SUZ12 的 `c.2170del`）；AD 缺值保留 `.`（舊版補 0）。
+> - `ZYGOSITY` 改用「真的 call 到 ALT」的那個 caller 的 GT（舊版 DV 是 `0/0` 時，會把 HC 的 call
+>   標成 `ref`）。
+> - 新增最後一欄 `HAPLOID_HET`：男性 chrX 非 PAR 原本叫成 het 的 call，**需人工複核**。SNV/indel 表 **82 欄**。
+> - 二級 ensemble 同步修正：DeepVariant 否決的候選不再進 ensemble、compound 合成結果先最小化
+>   （SUZ12 寫成 `chr17:31998951 AAA>TT`）、男性 chrX/chrY 的 het 另行處理。DRAGEN 路徑的
+>   `COMBINE_DRAGEN` 用的是同一支修正後的 `combine_phased.py`。
+>
 > v3.6 更新：新增 DGX-2 執行方式（檔名移除 DGM，本說明同時適用 DGM 與 DGX-2）、ClinGen 專家判讀對照（ERepo）、`--academic_dbnsfp`（dbNSFP 5.3a + 新 in-silico
 > 工具）、PVS1 改為 ClinGen SVI 決策樹分級、新增 DGX-2 profile（含 GPU lock）、
 > Pangolin 可切 CPU/GPU。SNV/indel 表由 65 欄擴充為 **81 欄**（新欄位一律附加在最後，
@@ -20,11 +42,11 @@
 
 | 步驟 | 功能 | 狀態 |
 |------|------|------|
-| PREPARE_VCF | NCKUH ensemble VCF 前處理（CALLERS tag、PASS 過濾）| ✅ 測試通過 |
+| PREPARE_VCF | NCKUH ensemble VCF 前處理（CALLERS tag、依 CALLERS 過濾，不看 FILTER；兩邊都沒 call 的 `NONE` 不進 annotation）| ✅ 測試通過 |
 | PREPARE_VCF_DRAGEN | DRAGEN VCF 前處理（CALLERS=DRAGEN、chrM 分流、自動建 tabix index）| ✅ 測試通過 |
 | VEP_ANNOTATE | VEP 115 annotation（dbNSFP、LOFTEE、ClinVar、gnomAD、1000G）| ✅ 測試通過 |
 | PANGOLIN_SCORE | Splice variant GPU inference | ✅ 測試通過 |
-| PARSE_CSQ | VEP CSQ 解析 + ClinVar lookup + 輸出 TSV（61 欄，含 STRAND_BIAS、HGNC_ID）| ✅ 測試通過 |
+| PARSE_CSQ | VEP CSQ 解析 + ClinVar lookup + 輸出 TSV（75 欄，含 STRAND_BIAS、HGNC_ID、HAPLOID_HET）| ✅ 測試通過 |
 | ACMG_CLASSIFY | ACMG/AMP Phase 1 自動分類（ClinGen SVI 2022）| ✅ 測試通過 |
 | MITO_ANNOTATE | mtDNA annotation（VEP 輕量 + gnomAD mito v3.1（CC0）+ ClinVar，NCKUH/DRAGEN 雙支援）| ✅ 測試通過 |
 | STR_ANNOTATE | STR threshold 分類（STRchive，NCKUH GangSTR/DRAGEN ExpansionHunter）| ✅ 測試通過 |
@@ -40,7 +62,7 @@
 
 | Phase | 功能 |
 |-------|------|
-| Phase 4 | WhatsHap phasing、Evo2 non-coding score、報告產生 |
+| Phase 4 | Evo2 non-coding score、報告產生（WhatsHap phasing 已完成：NCKUH 在二級、DRAGEN 用原生 PS 在三級 `COMBINE_DRAGEN`）|
 | Phase 5 | Phenotype module（Exomiser + LIRICAL）、ROH |
 
 ---
@@ -283,7 +305,7 @@ nextflow -c /home/pipeline/tertiary_code/nextflow_tertiary.config \
 │   ├── {SAMPLE_ID}.pangolin.vcf.gz                ← Splice variant 分數（中間檔）
 │   └── {SAMPLE_ID}.pangolin.vcf.gz.tbi
 ├── 03_acmg/
-│   └── {SAMPLE_ID}.snv_indel.acmg.tsv             ← ★ SNV/Indel 最終輸出（81 欄）
+│   └── {SAMPLE_ID}.snv_indel.acmg.tsv             ← ★ SNV/Indel 最終輸出（82 欄）
 ├── 04_mito/                                        ← ★ v3.2 新增
 │   ├── {SAMPLE_ID}.mito.tsv                       ← mtDNA 輸出（21 欄）
 │   └── {SAMPLE_ID}.mito.vep.vcf.gz               ← VEP 中間檔
@@ -306,10 +328,11 @@ nextflow -c /home/pipeline/tertiary_code/nextflow_tertiary.config \
 
 ---
 
-### 主要輸出欄位（snv_indel.acmg.tsv，81 欄）
+### 主要輸出欄位（snv_indel.acmg.tsv，82 欄）
 
-> v3.6 起由 65 欄擴充為 81 欄。**新欄位一律附加在最後**，既有欄位的位置沒有變動，
-> 用欄位編號取值的舊腳本不受影響（但新欄位的編號請以本節為準）。
+> v3.6 起由 65 欄擴充為 81 欄，v3.7 再加 `HAPLOID_HET`（82 欄）。**新欄位一律附加在
+> `parse_vep_csq.py` 輸出的最後**，所以欄 1–74 的位置沒有變；但 ACMG 那 7 欄接在後面，
+> 編號各往後移一格（`ACMG_CLASS`：77 → 78）。寫腳本時建議用欄位名稱查欄號，不要寫死（見「驗證指令」）。
 
 #### 位置資訊（欄 1–5）
 | 欄位 | 說明 |
@@ -331,11 +354,11 @@ nextflow -c /home/pipeline/tertiary_code/nextflow_tertiary.config \
 #### Caller 資訊（欄 15–23）
 | 欄位 | 說明 |
 |------|------|
-| CALLERS | `DV+HC` / `DV` / `HC`（NCKUH）或 `DRAGEN` |
-| DP_DV, AD_DV, VAF_DV | DeepVariant（DRAGEN 樣本為 DRAGEN）read depth、allelic depth、VAF |
+| CALLERS | `DV+HC` / `DV` / `HC`（NCKUH）或 `DRAGEN`。兩邊都沒 call 的 `NONE` 不會出現在表裡 |
+| DP_DV, AD_DV, VAF_DV | DeepVariant（DRAGEN 樣本為 DRAGEN）read depth、allelic depth、VAF。AD 的缺值是 `.`（例 `10,.` = 這個 caller 沒評估這個 allele），不是 0 |
 | DP_HC, AD_HC | HaplotypeCaller read depth、allelic depth（DRAGEN 無 HC，此二欄為空）|
-| ZYGOSITY | het / hom / hemizygous / unknown |
-| GT_DV, GT_HC | Genotype |
+| ZYGOSITY | het / hom / hemizygous（由「真的 call 到 ALT」的那個 caller 的 GT 推導，與 CALLERS 一致；兩邊都有 call 時用 DV。`hemizygous` 只給單套 GT（男性 chrX 非 PAR、chrY）；女性 chrX 與男性 PAR 的 `1/1` 是 `hom`。正常不會出現 `ref` / `unknown`）|
+| GT_DV, GT_HC | Genotype（例：`0/1` het、`1/1` hom、`1` 單套 hemizygous、`0/0` 沒有這個變異、`./.` 沒判定；`\|` 表示已 phase）|
 
 #### Strand bias（欄 24）
 | 欄位 | 說明 |
@@ -438,7 +461,21 @@ ACMG criteria。以 ClinVar Variation ID 對照到我們的表。
 | NMD | VEP NMD plugin：預測**逃過** NMD 時才有值；空值代表會被 NMD 降解 |
 | PROTEIN_POSITION | `123/456` 格式，用來算截斷掉多少比例的蛋白質 |
 
-#### ACMG 分類（欄 75–78）
+#### 男性單倍體區 het 標記（欄 75，v3.7 新增）
+| 欄位 | 說明 |
+|------|------|
+| HAPLOID_HET | 男性 chrX 非 PAR 原本叫成 het 的 caller（`DV` / `HC` / `DV,HC`；`.` = 無）|
+
+- 男性 chrX 非 PAR 只有一份，遺傳來的變異（不論顯性或隱性）會是 **hemizygous**，不會是 het。
+  叫成 het 的多半是比對假象（X/Y 高度相似區、片段重複、偽基因），但也可能是 **47,XXY 或體細胞嵌合**
+  —— X-linked 顯性、男性通常致死的疾病（IKBKG、MECP2、CDKL5、PORCN、OFD1）男性病人常是嵌合，
+  PCDH19 更是只有嵌合男性發病。
+- 二級在 `+fixploidy` 之前把這些 het 保留成 ALT（舊版會依 allele 順序變成 REF 消失或 hemizygous），
+  所以這些列的 `ZYGOSITY` 顯示 `hemizygous`、`HAPLOID_HET` 有值 → **請看 VAF 與位置人工判斷**。
+- 男性 chrY 的 het 不進報告（幾乎都是比對假象）。女性與性別 `unknown` 的樣本這欄一律是 `.`，
+  DRAGEN 樣本也一律是 `.`。
+
+#### ACMG 分類（欄 76–79）
 | 欄位 | 說明 |
 |------|------|
 | ACMG_CRITERIA | 觸發的所有 criteria，逗號分隔（如 `PVS1,PM2_Supporting`）|
@@ -446,7 +483,7 @@ ACMG criteria。以 ClinVar Variation ID 對照到我們的表。
 | ACMG_CLASS | `Pathogenic` / `Likely_Pathogenic` / `VUS` / `Likely_Benign` / `Benign` |
 | ACMG_NOTES | 觸發原因說明，含數值依據（如 `PVS1:LOFTEE=HC,gene=MECP2,HI=3`）|
 
-#### 與專家判讀的一致性 + PVS1 分級（欄 79–81，v3.6 新增）
+#### 與專家判讀的一致性 + PVS1 分級（欄 80–82，v3.6 新增）
 | 欄位 | 說明 |
 |------|------|
 | CLINGEN_AGREEMENT | `AGREE`（同一級）/ `DIFFER_TIER`（方向相同、強度不同）/ `DIFFER`（方向不同 → **優先人工複核**）/ `.`（無專家判讀）|
@@ -664,22 +701,23 @@ awk -F'\t' 'NR>1 && $13!=""' $PGX | cut -f3,13 | sort -u
 
 ## 驗證指令
 
-收到新版輸出後，請執行以下指令確認正確：
+收到新版輸出後，請執行以下指令確認正確（欄位一律用**名稱**查欄號，之後再加欄位也不用改指令）：
 
 ```bash
 # 設定路徑（替換 SAMPLE_ID）
 SAMPLE_ID=26WE0001
 TSV=/home/pipeline/tertiary_output/${SAMPLE_ID}/03_acmg/${SAMPLE_ID}.snv_indel.acmg.tsv
+col() { head -1 "$TSV" | tr '\t' '\n' | grep -nx "$1" | cut -d: -f1; }   # 欄位名 → 欄號
 
 echo "========================================="
-echo "Step 1：欄位數（應為 81）"
+echo "Step 1：欄位數（應為 82）"
 echo "========================================="
 head -1 $TSV | tr '\t' '\n' | wc -l
 
 echo ""
 echo "========================================="
 echo "Step 2：最後 10 個欄位名稱"
-echo "（確認 HGNC_ID 和 4 個 ACMG 欄位存在）"
+echo "（應看到 HAPLOID_HET、4 個 ACMG 欄、CLINGEN_AGREEMENT、PVS1_STRENGTH/REASON）"
 echo "========================================="
 head -1 $TSV | tr '\t' '\n' | tail -10
 
@@ -691,29 +729,41 @@ awk 'NR>1' $TSV | wc -l
 
 echo ""
 echo "========================================="
-echo "Step 4：CALLERS 欄位確認（第 15 欄）"
+echo "Step 4：CALLERS 分布"
 echo "（NCKUH 應為 DV+HC/DV/HC；DRAGEN 應為 DRAGEN）"
+echo "（若出現 NONE，代表 FILTER_FOR_ANNOTATION 沒有生效 —— NONE 不該進到 TSV）"
 echo "========================================="
-awk -F'\t' 'NR>1 {print $15}' $TSV | sort | uniq -c | sort -rn | head -5
+awk -F'\t' -v c=$(col CALLERS) 'NR>1 {print $c}' $TSV | sort | uniq -c | sort -rn | head -5
 
 echo ""
 echo "========================================="
 echo "Step 5：ClinVar 分布（應有非 . 的值）"
 echo "========================================="
-awk -F'\t' 'NR>1 {print $32}' $TSV | sort | uniq -c | sort -rn | head -10
+awk -F'\t' -v c=$(col CLINVAR_SIG) 'NR>1 {print $c}' $TSV | sort | uniq -c | sort -rn | head -10
 
 echo ""
 echo "========================================="
 echo "Step 6：ACMG 分類分布"
 echo "========================================="
-awk -F'\t' 'NR>1 {print $77}' $TSV | sort | uniq -c | sort -rn
+awk -F'\t' -v c=$(col ACMG_CLASS) 'NR>1 {print $c}' $TSV | sort | uniq -c | sort -rn
 
 echo ""
 echo "========================================="
 echo "Step 7：P/LP variant 詳細資訊"
 echo "========================================="
-awk -F'\t' 'NR>1 && ($77=="Pathogenic" || $77=="Likely_Pathogenic")' $TSV \
-    | cut -f1,2,6,11,75,76,77,78,80 | head -10   # GENE/HGVS/ACMG 4 欄 + PVS1_STRENGTH
+awk -F'\t' -v c=$(col ACMG_CLASS) 'NR>1 && ($c=="Pathogenic" || $c=="Likely_Pathogenic")' $TSV \
+    | cut -f1,2,$(col GENE),$(col HGVS_C),$(col ACMG_CRITERIA),$(col ACMG_SCORE),$(col ACMG_CLASS),$(col ACMG_NOTES),$(col PVS1_STRENGTH) \
+    | head -10
+
+echo ""
+echo "========================================="
+echo "Step 8：ZYGOSITY 與 HAPLOID_HET"
+echo "（ZYGOSITY 只應有 het/hom/hemizygous；hemizygous 只在男性 chrX 非 PAR / chrY（女性應為 0）；"
+echo "  HAPLOID_HET 只會出現在 NCKUH 男性 chrX）"
+echo "========================================="
+awk -F'\t' -v c=$(col ZYGOSITY) 'NR>1 {print $c}' $TSV | sort | uniq -c | sort -rn
+awk -F'\t' -v c=$(col ZYGOSITY) 'NR>1 && $c=="hemizygous" {print $1}' $TSV | sort | uniq -c
+awk -F'\t' -v c=$(col HAPLOID_HET) 'NR>1 && $c!="." {print $1, $c}' $TSV | sort | uniq -c
 
 echo ""
 echo "========================================="
@@ -775,8 +825,7 @@ wc -l $CNV_DIR/${SAMPLE_ID}.cnv.annotated.tsv
 wc -l $CNV_DIR/${SAMPLE_ID}.sv.annotated.tsv
 
 # CNV：確認有 AnnotSV 分類欄位
-head -1 $CNV_DIR/${SAMPLE_ID}.cnv.annotated.tsv | tr '	' '
-' | grep -n "AnnotSV_ranking\|ACMG\|Pathogenic"
+head -1 $CNV_DIR/${SAMPLE_ID}.cnv.annotated.tsv | tr '\t' '\n' | grep -n "AnnotSV_ranking\|ACMG\|Pathogenic"
 
 # SV：確認 unannotated 筆數（沒有對應基因的 SV，通常為少數）
 wc -l $CNV_DIR/${SAMPLE_ID}.sv.unannotated.tsv
@@ -789,6 +838,15 @@ SAMPLE_ID=VAL-10
 cat /home/pipeline/tertiary_output/${SAMPLE_ID}/00_prepare/${SAMPLE_ID}.ploidy_qc.txt
 # 預期：estimated_sex_karyotype 與 samplesheet 宣告一致 → sex_check: OK
 # 每條 contig 的 NDC 應 ~1.0；偏離過多的 contig 會列在 WARNINGS（疑似非整倍體，需人工確認）
+# ⚠️ sex_check 比的是 DRAGEN ploidy.vcf 內的 declared 與 estimated；declared 是 unknown 時一律 OK，
+#    所以 estimated 這行請再對一次臨床性別，並用下面三項交叉核對。
+
+# 性別交叉核對（VAL-10 女性實測：chrX 全為雙套、chrY 0 筆、chrX STR 皆兩個 allele）
+V=/home/pipeline/tertiary_output/${SAMPLE_ID}/00_prepare/${SAMPLE_ID}.snv_for_annotation.vcf.gz
+bcftools query -r chrX -f '[%GT]\n' $V | sort | uniq -c | sort -rn   # 女性：0/1、1/1…（雙套）；男性：非 PAR 為單套 1
+bcftools view -H -r chrY $V | wc -l                                   # 女性：0 或極少
+awk -F'\t' 'NR==1 || $1=="chrX"' /home/pipeline/tertiary_output/${SAMPLE_ID}/05_str/${SAMPLE_ID}.str.tsv \
+    | cut -f1,2,5,9,10                                                # 女性：REPCN_A2 有值；男性為 .
 ```
 
 ### PGx 輸出確認
@@ -838,6 +896,13 @@ grep "MT-RNR1" $PGX_DIR/${SAMPLE_ID}.pgx.tsv | cut -f3,4,13,14,15
 # 臨床警示
 echo "--- B*57:01 / B*58:01 ---"
 grep "HLA-B" $PGX_DIR/${SAMPLE_ID}.pgx.tsv | cut -f3,4,6 | head -3
+
+# DRAGEN 樣本：與 DRAGEN 原生 PGx 判讀的一致性（以基因計；pgx.tsv 一個基因有多列，不要直接數列數）
+echo "--- DRAGEN 交叉註記 ---"
+awk -F'\t' 'NR==1{for(i=1;i<=NF;i++){if($i=="GENE")g=i; if($i=="NOTES")n=i}; next}
+    match($n, /DRAGEN (一致|不一致|未比對)/){print $g "\t" substr($n, RSTART, RLENGTH)}' \
+    $PGX_DIR/${SAMPLE_ID}.pgx.tsv | sort -u
+# VAL-10（2026-07）：一致 10、不一致 2（CYP2D6 結構型排列、DPYD）
 ```
 
 > **PGx 結果解讀：** HLA-B `*57:01 negative` 表示無 abacavir 過敏風險；`*58:01 negative` 表示無 allopurinol 嚴重過敏風險；`*15:02 negative` 表示無 carbamazepine 嚴重皮膚反應風險。這三個是台灣臨床最常用的 CPIC Level A HLA 警示。
@@ -849,6 +914,31 @@ grep "HLA-B" $PGX_DIR/${SAMPLE_ID}.pgx.tsv | cut -f3,4,6 | head -3
 **Q：`-resume` 沒有效果，從頭重跑？**
 
 代表 work 目錄不存在或被清除。加上 `-resume` 即可讓已完成的 process 不重跑。
+
+**Q：換了 `scripts/` 裡的 .py 之後加 `-resume`，那一步卻沒有重跑？**
+
+`add_callers_tag.py`、`parse_vep_csq.py` 等是用路徑呼叫（`python3 ${params.scripts_dir}/…`），Nextflow 的
+快取只比對指令文字，看不到腳本內容變了。只換腳本時請**不要加 `-resume`**（或先刪掉該樣本的輸出重跑）。
+輸入 VCF 變了（例如二級重跑過）則會自動重跑。`combine_phased.py` 是以 input 檔傳入，不受此限。
+
+**Q：同一個變異出現兩列，一列 `CALLERS=DV`、一列 `CALLERS=HC`？**
+
+代表 DV 與 HC 對同一個變異的寫法不同，在二級 merge 時沒有合在一起。v3.7 修正後已極少
+（VAL55 從 23,023 個降到 2 個，剩下的是重複序列裡 indel 的擺放位置不同）。兩列的深度各自正確，可當成
+兩個 caller 都有 call 到。v3.8 起 phase 未知的重疊變異不再合成（見下一題），NCKUH 在二級重跑後這類兩列可能略增。
+
+**Q：同一處出現兩筆互相重疊的變異（例如一個缺失，和落在它範圍內的 SNV 或另一個缺失）？**
+
+v3.8 起，phase 未知（沒有 PS，或 PS 不同）或互相矛盾的重疊變異**不再合成**，兩筆都原樣保留。兩個重疊的
+het 變異不可能同在一條染色體上（SNV 所在的鹼基已經被缺失刪掉），比較可能是各在一條（複合雜合，等同 `1/2`），
+或其中一筆是假訊號 —— 請用 IGV 看讀數判斷。舊版會把它們硬合成一筆：其中一個變異消失（VAL-10：7,927 個），
+或變成兩個 caller 都沒 call 的變異。有共同 PS 的 compound（如 SUZ12 的 delinsTT）照樣合成。
+
+**Q：男性樣本的 chrX 有 `HAPLOID_HET`，是錯誤嗎？**
+
+不是錯誤，是**提醒人工複核**。男性 chrX 非 PAR 只有一份，理論上不會有 het；叫成 het 的多半是比對假象，
+但也可能是體細胞嵌合或 47,XXY（見「男性單倍體區 het 標記」一節）。請看 VAF 與位置判斷：落在 X/Y 高度
+相似區或片段重複的，多半是假象。
 
 **Q：Pangolin 輸出是空的？**
 

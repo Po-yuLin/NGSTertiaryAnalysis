@@ -24,7 +24,7 @@
  *   需包含：cyvcf2、bcftools、bgzip、tabix
  *
  * Script 執行順序：
- *   1. tabix：若 .tbi 不存在則自動建立
+ *   1. bcftools norm -m -any；非 chrM 只留這個樣本真的有 call 到 ALT 的紀錄（拆開後的 0/0 丟掉）
  *   2. add_dragen_tag.py：加 INFO tag，分流 SNV / Mito
  *   3. bgzip + tabix：壓縮並建立 index
  *   4. bcftools stats：輸出統計
@@ -60,7 +60,15 @@ process ADD_DRAGEN_TAG {
     #   -c w：REF 與參考不符時只警告不中斷。
     bcftools norm -m -any -f ${params.ref_fasta} -c w \\
         ${dragen_vcf} \\
-        -Oz -o ${sample_id}.norm.vcf.gz
+        -Oz -o ${sample_id}.split.vcf.gz
+
+    # Step 1b：拆開後，這個樣本沒有帶的 allele 會變成一筆 GT 0/0（2026-09，VAL-10：CYP21A2 targeted caller
+    #   的 C>G,A 2/2 → C>G 0/0 + C>A 1/1，報告多出一列 ZYGOSITY=ref 的 c.293-13C>G）。非 chrM 只留有 ALT 的：
+    #   GT="alt" 留 0/1、1/1、單套 1…，丟 0/0、./.、單套 0、半缺失 ./1 —— 與 NCKUH 用 CALLERS=NONE 擋掉的
+    #   是同一個定義（add_callers_tag.is_called）。chrM 全部保留（Mito module 自行判斷）。
+    bcftools view -i 'GT="alt" || CHROM="chrM" || CHROM="MT"' \\
+        ${sample_id}.split.vcf.gz -Oz -o ${sample_id}.norm.vcf.gz
+    echo "[ADD_DRAGEN_TAG] ${sample_id} 沒有 call 到 ALT 而丟棄（非 chrM）：\$(bcftools view -H -e 'GT="alt" || CHROM="chrM" || CHROM="MT"' ${sample_id}.split.vcf.gz | wc -l)" >&2
     tabix -p vcf ${sample_id}.norm.vcf.gz
 
     # Step 2：add_dragen_tag.py（吃正規化後的 biallelic VCF）
@@ -87,7 +95,7 @@ process ADD_DRAGEN_TAG {
     bcftools stats ${sample_id}.mito_for_annotation.vcf.gz | grep "^SN" >&2
 
     # 清理暫時檔
-    rm -f ${sample_id}.snv_raw.vcf ${sample_id}.mito_raw.vcf
+    rm -f ${sample_id}.snv_raw.vcf ${sample_id}.mito_raw.vcf ${sample_id}.split.vcf.gz
     """
 }
 
@@ -101,6 +109,12 @@ process ADD_DRAGEN_TAG {
 //   由 params.combine_phased 開關（預設 true）。chrM 多半無 PS，實質不受影響。
 //   ⚠️ combine_py 以 staged path input 傳入（不用 ${params.scripts_dir}/… 直呼），這樣 nextflow
 //      會對 script「內容」計 hash → 改了 script 後 -resume 會正確重跑，不會沿用舊快取（與二級一致）。
+//   ⚠️ 非 chrM 只拿 PASS 進 combine（2026-09）。合成紀錄的 FILTER 沿用 anchor（叢集內最寬那筆），
+//      而 ADD_DRAGEN_TAG 只收 PASS；舊版讓 non-PASS 也進叢集，PASS 與 non-PASS 同叢時：
+//        anchor 是 non-PASS → 整筆被丟掉，原本會出報告的 PASS 變異跟著消失；
+//        anchor 是 PASS     → DRAGEN 濾掉的 allele 被拼進報告裡的 MNV。
+//      non-PASS 本來就會在 ADD_DRAGEN_TAG 被丟掉，先濾掉不影響其他結果。chrM 全部保留（Mito module
+//      保留所有 FILTER，由臨床端自行篩選；依決定不動 chrM）。
 // ──────────────────────────────────────────────────────────────
 process COMBINE_DRAGEN {
 
@@ -117,9 +131,12 @@ process COMBINE_DRAGEN {
 
     script:
     """
+    # 非 chrM 只留 PASS（與 ADD_DRAGEN_TAG 的 PASS 判定一致：PASS 或 .）；chrM 全部保留。原因見上方 ⚠️。
+    bcftools view -i 'FILTER="PASS" || FILTER="." || CHROM="chrM" || CHROM="MT"' \\
+        ${dragen_vcf} -Oz -o ${sample_id}.dragen.pass.vcf.gz
     # combine_phased.py 只用 Python 標準庫，讀 (bgzip) VCF、自帶 faidx（讀 \${ref_fasta}.fai）。
     python3 ${combine_py} \\
-        --in ${dragen_vcf} \\
+        --in ${sample_id}.dragen.pass.vcf.gz \\
         --out ${sample_id}.dragen.combined.vcf \\
         --fasta ${params.ref_fasta} \\
         --max-gap ${params.combine_max_gap}
@@ -127,7 +144,7 @@ process COMBINE_DRAGEN {
     bcftools sort ${sample_id}.dragen.combined.vcf \\
         -Oz -o ${sample_id}.dragen.combined.vcf.gz
     bcftools index -t ${sample_id}.dragen.combined.vcf.gz
-    rm -f ${sample_id}.dragen.combined.vcf
+    rm -f ${sample_id}.dragen.combined.vcf ${sample_id}.dragen.pass.vcf.gz
     """
 }
 

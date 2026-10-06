@@ -53,6 +53,7 @@ add_callers_tag.py
     DV+HC  → DeepVariant 和 HaplotypeCaller 都有 call（最高信心度）
     DV     → 只有 DeepVariant call
     HC     → 只有 HaplotypeCaller call
+    NONE   → 兩個都沒有 ALT genotype（./. 或 0/0）；FILTER_FOR_ANNOTATION 會擋掉
 
 使用方式（由 Nextflow module prepare_vcf.nf 呼叫）：
     bcftools view ensemble.fixed.vcf.gz | \\
@@ -80,7 +81,8 @@ add_callers_tag.py
     {SAMPLE_ID}_DV 和 {SAMPLE_ID}_HC）處理為三級分析可用的單一樣本 VCF。
 
     在 INFO 欄位新增以下 tag：
-        CALLERS   → 哪些 caller 偵測到此 variant（DV+HC / DV / HC）
+        CALLERS   → 哪些 caller 偵測到此 variant（DV+HC / DV / HC / NONE）
+                    NONE = 兩邊都沒有 ALT genotype；FILTER_FOR_ANNOTATION 會擋掉
         DP_DV     → DeepVariant 的 read depth
         AD_DV     → DeepVariant 的 allelic depth（REF,ALT 逗號分隔）
         VAF_DV    → DeepVariant 的 variant allele fraction
@@ -142,7 +144,21 @@ def is_called(gt_tuple) -> bool:
 
 
 def determine_callers(variant, dv_idx: int, hc_idx: int) -> str:
-    """DV 和 HC 的 call 狀態 → CALLERS 字串"""
+    """
+    DV 和 HC 的 call 狀態 → CALLERS 字串。
+
+    ⚠️ 四種情況都要明確處理，**不能讓「兩邊都沒 call」掉進 else 當成 HC**。
+      舊版寫成 `if DV+HC / elif DV / else "HC"`，於是 DV=./. 或 0/0 且 HC=./. 或 0/0
+      的紀錄全部被標成 "HC"，通過 FILTER_FOR_ANNOTATION 進到 ACMG 表，
+      以 ZYGOSITY=ref/unknown 的「幽靈列」出現。
+      實例（SUZ12 chr17:31998950）：ensemble 的 `--merge all` 把 DV 否決的候選
+      `GAAA>GAA`（DV ./.）與 HC 合併後的 `GAAA>GTT`（HC 0|1）併成多等位，
+      三級 norm 拆開後 `GA>G` 那筆是 DV ./. + HC 0|0 —— 兩邊都沒 call，卻被標 HC，
+      於是報告多出一個錯誤的 c.2170del。
+
+    回傳 "NONE" 而不是不寫 tag：FILTER_FOR_ANNOTATION 的 -i 條件只收
+    DV+HC / DV / HC，NONE 會被自然擋掉；同時留在 callers_tagged VCF 裡可供稽核。
+    """
     dv_called = is_called(variant.genotypes[dv_idx])
     hc_called = is_called(variant.genotypes[hc_idx])
 
@@ -150,8 +166,10 @@ def determine_callers(variant, dv_idx: int, hc_idx: int) -> str:
         return "DV+HC"
     elif dv_called:
         return "DV"
-    else:
+    elif hc_called:
         return "HC"
+    else:
+        return "NONE"
 
 
 # ──────────────────────────────────────────────
@@ -180,10 +198,15 @@ def get_dp(variant, sample_idx: int) -> str:
 def get_ad(variant, sample_idx: int) -> str:
     """
     從 FORMAT/AD 取得 allelic depth。
-    回傳 "REF,ALT" 格式字串，missing 時回傳 "."
+    回傳 "REF,ALT" 格式字串，全部 missing 時回傳 "."
 
     multiallelic site 的 AD 格式為 "REF,ALT1,ALT2"，完整保留。
-    負數值（cyvcf2 的 missing 表示）替換為 0。
+    **個別 missing 的元素保留為 "."**（例如 "10,."），不可補 0：
+      「這個 caller 對這個 allele 沒有資料」和「這個 caller 看了、0 條 reads 支持」
+      是兩件完全不同的事，後者會讓審閱者以為這個變異是 artifact。
+      實例（SUZ12 delinsTT）：DV 從未把 GTT 當成候選，AD 是 "10,."；舊版補成
+      "10,0"，讓一個真的 het frameshift 看起來 VAF=0。
+    （cyvcf2 以 -2147483648 表示 integer missing，故以 < 0 判斷。）
     """
     try:
         ad = variant.format("AD")
@@ -192,7 +215,7 @@ def get_ad(variant, sample_idx: int) -> str:
         vals = ad[sample_idx]
         if all(v < 0 for v in vals):
             return "."
-        cleaned = [str(max(int(v), 0)) for v in vals]
+        cleaned = [str(int(v)) if v >= 0 else "." for v in vals]
         return ",".join(cleaned)
     except Exception:
         return "."
@@ -256,7 +279,8 @@ def add_callers_tag(input_path: str, sample_id: str, output_path: str):
             'Type': 'String',
             'Description': (
                 'Variant callers that detected this variant: '
-                'DV+HC (both), DV (DeepVariant only), HC (HaplotypeCaller only)'
+                'DV+HC (both), DV (DeepVariant only), HC (HaplotypeCaller only), '
+                'NONE (neither caller has an ALT genotype; excluded from annotation)'
             )
         },
         {
@@ -311,6 +335,7 @@ def add_callers_tag(input_path: str, sample_id: str, output_path: str):
     n_dv_hc = 0
     n_dv_only = 0
     n_hc_only = 0
+    n_none = 0
 
     for variant in vcf_in:
         n_total += 1
@@ -328,13 +353,16 @@ def add_callers_tag(input_path: str, sample_id: str, output_path: str):
         variant.INFO["DP_HC"] = get_dp(variant, hc_idx)
         variant.INFO["AD_HC"] = get_ad(variant, hc_idx)
 
-        # 統計
+        # 統計（四類分開數；舊版 else 把 NONE 也算進 HC only，
+        #   prepare_vcf.nf 註解裡的「HC-only 23.9%」就是這個被灌水的數字）
         if callers == "DV+HC":
             n_dv_hc += 1
         elif callers == "DV":
             n_dv_only += 1
-        else:
+        elif callers == "HC":
             n_hc_only += 1
+        else:
+            n_none += 1
 
         vcf_out.write_record(variant)
 
@@ -347,6 +375,8 @@ def add_callers_tag(input_path: str, sample_id: str, output_path: str):
     print(f"[INFO]   DV+HC：{n_dv_hc:,} ({n_dv_hc/n_total*100:.1f}%)", file=sys.stderr)
     print(f"[INFO]   DV only：{n_dv_only:,} ({n_dv_only/n_total*100:.1f}%)", file=sys.stderr)
     print(f"[INFO]   HC only：{n_hc_only:,} ({n_hc_only/n_total*100:.1f}%)", file=sys.stderr)
+    print(f"[INFO]   NONE（兩邊都沒 call，不進 annotation）：{n_none:,} "
+          f"({n_none/n_total*100:.1f}%)", file=sys.stderr)
 
 
 # ──────────────────────────────────────────────

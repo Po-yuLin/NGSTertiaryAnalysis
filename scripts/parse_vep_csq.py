@@ -148,27 +148,68 @@ def clnrevstat_to_stars(revstat: str) -> int:
 # Zygosity 推導
 # ──────────────────────────────────────────────────────────────
  
+def _gt_called(gt: str) -> bool:
+    """GT 是否「真的 call 到 ALT」：沒有缺失 allele，且至少一個非 0 allele。
+    與 add_callers_tag.is_called() 同一定義（CALLERS 就是依它判斷），
+    所以 ZYGOSITY 會取 CALLERS 裡那個 caller 的 GT。"""
+    if gt in (".", "./.", ".|.", ""):
+        return False
+    alleles = gt.replace("|", "/").split("/")
+    if any(a == "." for a in alleles):
+        return False
+    return any(a != "0" for a in alleles)
+
+
+def haploid_het_callers(flag: str, callers: str) -> str:
+    """二級 haploid_het.awk 的 INFO/HAPLOID_HET（男性 chrX 非 PAR 原本叫成 het 的 caller，
+    GT 已被改成 ALT 才進 +fixploidy），只留「這一筆真的有 call」的 caller（CALLERS）。
+    多等位拆開後 INFO 會複製到每一筆，但原本是 het 的可能只是其中一個 allele。
+    沒有標記、或交集為空 → "."。DRAGEN 不會有這個 tag。"""
+    if not flag or flag == ".":
+        return "."
+    called = set(callers.split("+")) if callers and callers != "." else set()
+    kept = [c for c in flag.split(",") if c in called]
+    return ",".join(kept) if kept else "."
+
+
 def infer_zygosity(gt_dv: str, gt_hc: str, chrom: str) -> str:
-    gt = gt_dv if gt_dv not in (".", "./.", ".|.") else gt_hc
+    # 用「真的 call 到 ALT」的那個 caller 的 GT（兩邊都有時 DV 優先）。
+    # ⚠️ 舊版只要 DV 的 GT 不是 missing 就用 DV 的 —— 連 0/0 也用。DV 與 HC 在同一 POS
+    #   call 到不同 allele 時，二級 --merge all 把兩者併成多等位，三級 norm 拆開後，
+    #   HC 那個 allele 的 DV 欄是 0/0 → HC 真的 call 到的變異被標成 "ref"
+    #   （VAL55：15,422 列，如 chr1:83829、chr1:602156；男性 chrX 的 DV 0 + HC 1 同理）。
+    #   兩邊都沒 call 到時沿用舊邏輯（CALLERS=NONE 已在 FILTER_FOR_ANNOTATION 擋掉，正常不會走到）。
+    #   DRAGEN：gt_hc 恆為 "."，結果與舊版相同。
+    if _gt_called(gt_dv):
+        gt = gt_dv
+    elif _gt_called(gt_hc):
+        gt = gt_hc
+    else:
+        gt = gt_dv if gt_dv not in (".", "./.", ".|.") else gt_hc
     if gt in (".", "./.", ".|.", ""):
         return "unknown"
     gt_norm = gt.replace("|", "/")
+    slots = gt_norm.split("/")          # GT 的套數：1 = 單套（haploid），2 = 雙套
     # 去掉 missing allele（拆分多等位基因後可能出現半缺失，如 1/.）
-    called = [a for a in gt_norm.split("/") if a != "."]
+    called = [a for a in slots if a != "."]
     if not called:
         return "unknown"
     is_sex = chrom in ("chrX", "chrY", "X", "Y")
     alt_alleles = [a for a in called if a != "0"]
     if not alt_alleles:
         return "ref"
-    # haploid 或拆分後只剩單一有效 allele（例如 1/. → 該 ALT 僅一份）
-    if len(called) == 1:
+    # 單套 GT（男性 chrX 非 PAR、chrY）→ hemizygous。
+    # ⚠️ 套數看 GT 本身、不看染色體（2026-09）：舊版在 chrX/chrY 上只要兩個 allele 都是 ALT 就標
+    #   hemizygous → 女性 chrX 與男性 PAR 的 1/1 都被標成 hemizygous（VAL-10 女性的 chrX 一個 hom 都沒有）。
+    #   套數已寫在 GT 裡：NCKUH 男性非 PAR 經二級 +fixploidy 變單套；DRAGEN 男性非 PAR 本來就叫成單套。
+    #   所以性染色體上的雙套 GT = 女性、PAR 或性別未知 → 與體染色體同一套規則。
+    if len(slots) == 1:
         return "hemizygous" if is_sex else "het"
-    # 二倍體且兩個都是 ALT
+    # 雙套但另一個 allele 缺失（半缺失，如 1/.）→ 只知道有一份 ALT → het
+    if len(called) == 1:
+        return "het"
+    # 雙套且兩個都是 ALT：1/1（相同 ALT）→ hom；1/2（不同 ALT，複合雜合）→ het
     if "0" not in called:
-        if is_sex:
-            return "hemizygous"
-        # 1/1（相同 ALT）→ hom；1/2（不同 ALT，複合雜合）→ het
         return "hom" if len(set(alt_alleles)) == 1 else "het"
     # 一 ref 一 alt
     return "het"
@@ -639,6 +680,9 @@ OUTPUT_COLUMNS = [
     # ClinGen SVI PVS1 決策樹（Abou Tayoun 2018）所需的原始欄位
     "NMD",                          # VEP NMD plugin：是否逃過 nonsense-mediated decay
     "PROTEIN_POSITION",             # Protein_position（--total_length → "123/456"），算截斷比例用
+    # 男性單倍體區（chrX 非 PAR）原本叫成 het 的 caller（二級 haploid_het.awk 標記；"." = 無）。
+    #   有值 = 需人工複核：可能是體細胞嵌合、47,XXY 或比對假象；ZYGOSITY 仍顯示 hemizygous。
+    "HAPLOID_HET",
 ]
  
  
@@ -745,6 +789,7 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
                     info_dict[k] = v
  
             callers = info_dict.get("CALLERS", ".")
+            haploid_het = haploid_het_callers(info_dict.get("HAPLOID_HET", "."), callers)
 
             if input_type == "dragen":
                 # DRAGEN 單一 sample：INFO tag 名稱不同
@@ -957,6 +1002,7 @@ def parse_vep_vcf(vep_vcf: str, pangolin_scores: dict,
                     "DBNSFP_VERSION":       dbnsfp_version,
                     "NMD":                  get(picked_tx, "NMD"),
                     "PROTEIN_POSITION":     get(picked_tx, "Protein_position"),
+                    "HAPLOID_HET":          haploid_het,
                 }
 
                 row_str = "\t".join(row_dict[col] for col in OUTPUT_COLUMNS) + "\n"

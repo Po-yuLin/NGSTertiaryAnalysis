@@ -40,12 +40,14 @@
  *   處理為三級分析 VEP annotation 的輸入，共兩個步驟：
  *
  *   Step 1 - ADD_CALLERS_TAG：
- *     執行 add_callers_tag.py，在 INFO 欄位新增 CALLERS tag（DV+HC/DV/HC）
+ *     執行 add_callers_tag.py，在 INFO 欄位新增 CALLERS tag（DV+HC/DV/HC/NONE；
+ *     NONE = 兩個 caller 都沒有 ALT genotype，Step 2 會擋掉）
  *
  *   Step 2 - FILTER_FOR_ANNOTATION：
- *     用 bcftools 過濾掉不適合送進 VEP 的 variant：
- *       - RefCall（FILTER=RefCall，DV 叫 0/0 但 HC 叫 ./. 的情況）
- *       - 兩個 sample column 都是 0/0 或 ./. 的 variant
+ *     用 bcftools 依 CALLERS 過濾（不看 FILTER 欄）：只收 DV+HC / DV / HC，
+ *     擋掉 CALLERS=NONE（兩個 sample column 都沒有 ALT genotype，./. 或 0/0）。
+ *     ⚠️ 這個「擋掉兩邊都沒 call」的設計原本就寫在這裡，但舊版 add_callers_tag.py
+ *        把這種紀錄標成 HC，所以實際上從未生效（見下方 FILTER_FOR_ANNOTATION 註解）。
  *     同時 bgzip 壓縮 + tabix index，產生標準的 .vcf.gz + .tbi
  *
  * 輸入（來自 main_tertiary.nf）：
@@ -125,24 +127,25 @@ process FILTER_FOR_ANNOTATION {
     # 過濾策略：依據 CALLERS tag 過濾，不使用 FILTER 欄位。
     #
     # 背景：
-    #   ensemble VCF 的 FILTER 欄位由二級分析設定，語義如下：
-    #     FILTER=PASS    → DV 有 call（DV+HC 或 DV-only）
-    #     FILTER=RefCall → DV 叫 0/0（HC 可能有 call 也可能是 ./.）
-    #     FILTER=.       → 兩個 caller 都沒有 call
+    #   ensemble 的 FILTER 是 bcftools merge 從各 caller 的紀錄合併而來，不代表
+    #   「哪個 caller 有 call」—— 用 FILTER="PASS" 過濾會把 HC-only 的 call 丟掉，
+    #   違反 ensemble「只要有一個 caller call 到就保留」的設計。
+    #   （二級 BCFTOOLS_ENSEMBLE 已在 merge 前丟掉 DV 沒有 ALT 的紀錄，所以
+    #    ensemble 裡不會再出現 DV 的 FILTER=RefCall；見二級 postprocessing.nf。）
     #
-    # 問題：
-    #   用 FILTER="PASS" 過濾會把所有 HC-only variant（FILTER=RefCall）
-    #   全部丟掉，違反 joint calling「只要有一個 caller call 到就保留」的規則。
-    #   NA12878_WES 測試確認：HC-only 佔 23.9%（8,897/37,198 個），不應被丟棄。
+    # CALLERS 由 add_callers_tag.py 依 GT 判斷，四種值：
+    #   CALLERS=DV+HC → 兩個都有 ALT call
+    #   CALLERS=DV    → 只有 DV 有 ALT call
+    #   CALLERS=HC    → 只有 HC 有 ALT call
+    #   CALLERS=NONE  → 兩個都沒有 ALT call（./. 或 0/0）→ 下面的 -i 條件會擋掉
     #
-    # 修正：
-    #   add_callers_tag.py 已根據 GT 欄位正確判斷每個 variant 的 call 狀態：
-    #     CALLERS=DV+HC → 兩個都有 ALT call，來自 FILTER=PASS
-    #     CALLERS=DV    → 只有 DV 有 ALT call，來自 FILTER=PASS
-    #     CALLERS=HC    → 只有 HC 有 ALT call，來自 FILTER=RefCall（HC=0/1）
-    #   RefCall 中 DV=0/0, HC=./. 的 variant，CALLERS 被判為 HC（但 is_called 回傳 False）
-    #   → 實際上這種 case 兩個 caller 都沒有 call，不會有 CALLERS tag。
-    #   所以只要 CALLERS 有值，就代表至少一個 caller 有有效的 ALT call。
+    # ⚠️ 舊版 add_callers_tag.py 的 determine_callers() 沒有 NONE：兩邊都沒 call
+    #   會掉進 else 被標成 "HC"，於是這些非變異紀錄通過本步驟、以
+    #   ZYGOSITY=ref/unknown 出現在 ACMG 表（實例：SUZ12 多出錯誤的 c.2170del）。
+    #   這段註解舊版還寫著「這種 case 不會有 CALLERS tag」—— 那是錯的，tag 一律會寫。
+    #   同一個 else 也讓 stderr 的「HC only」統計被灌水：舊註解引用的
+    #   「NA12878_WES HC-only 23.9%（8,897/37,198）」包含了這些 no-call 紀錄。
+    #   修正後實測（VAL55 WGS，2026-09）：DV+HC 89.9%、DV only 2.6%、HC only 7.4%、NONE 0.2%。
 
     bcftools view \\
         -i 'INFO/CALLERS="DV+HC" || INFO/CALLERS="DV" || INFO/CALLERS="HC"' \\
